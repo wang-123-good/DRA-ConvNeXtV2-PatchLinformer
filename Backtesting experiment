@@ -1,0 +1,200 @@
+import os, math, json, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+warnings.filterwarnings("ignore")
+
+# =================== 可调参数 ===================
+OUT_BASE_DIR   = "./dra_convnextv2_patchlinformer"
+IN_CSV         = os.path.join(OUT_BASE_DIR, "preds_test_with_prices.csv")
+
+START_DATE_STR = "2024-09-01"
+END_DATE_STR   = "2025-09-01"
+PROB_THRESH    = 0.40
+REBAL_DAYS     = 15
+INIT_CASH      = 1_000_000.0
+
+TRADING_DAYS_PER_YEAR = 252
+RISK_FREE_DAILY = 0.0
+
+OUT_DIR = os.path.join(
+    OUT_BASE_DIR, f"backtest_{START_DATE_STR.replace('-','')}_{END_DATE_STR.replace('-','')}_prob04_h15_rebalance"
+)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# =================== 工具函数 ===================
+def annualized_return_from_curve(equity: np.ndarray, dates: pd.Series) -> float:
+    if equity.size < 2:
+        return 0.0
+    total_ret = equity[-1] / equity[0] - 1.0
+    days = (pd.to_datetime(dates.iloc[-1]) - pd.to_datetime(dates.iloc[0])).days
+    if days <= 0:
+        return float(total_ret)
+    return float((1.0 + total_ret) ** (365.0 / days) - 1.0)
+
+def sharpe_ratio(daily_returns: np.ndarray, rf_daily: float = 0.0) -> float:
+    if daily_returns.size == 0:
+        return 0.0
+    excess = daily_returns - rf_daily
+    mu = np.mean(excess)
+    sigma = np.std(excess, ddof=1)
+    if sigma == 0 or np.isnan(sigma):
+        return 0.0
+    return float(mu / sigma * math.sqrt(TRADING_DAYS_PER_YEAR))
+
+def max_drawdown(equity: np.ndarray) -> float:
+    if equity.size == 0:
+        return 0.0
+    peaks = np.maximum.accumulate(equity)
+    dd = (equity - peaks) / peaks
+    return float(-dd.min()) if dd.size > 0 else 0.0
+
+# =================== 数据读取 ===================
+if not os.path.exists(IN_CSV):
+    raise FileNotFoundError(f"找不到输入文件：{IN_CSV}\n请先运行训练脚本，确保已生成 preds_test_with_prices.csv。")
+
+df = pd.read_csv(IN_CSV)
+for col in ["date_t1", "open_t1", "close_t1", "probs_up"]:
+    if col not in df.columns:
+        raise RuntimeError(f"缺少必要列：{col}")
+
+df["date_t1"] = pd.to_datetime(df["date_t1"], errors="coerce")
+df = df.dropna(subset=["date_t1"]).sort_values("date_t1").reset_index(drop=True)
+
+mask = (df["date_t1"] >= pd.to_datetime(START_DATE_STR)) & (df["date_t1"] <= pd.to_datetime(END_DATE_STR))
+df = df.loc[mask].reset_index(drop=True)
+if df.empty:
+    raise RuntimeError("指定时间区间内没有数据。")
+
+dates = df["date_t1"]
+open1 = df["open_t1"].astype(float).values
+close1= df["close_t1"].astype(float).values
+p_up  = df["probs_up"].astype(float).values
+N     = len(df)
+
+# =================== 回测逻辑 ===================
+in_position = False
+entry_idx   = -1
+entry_price = np.nan
+equity_curve, daily_returns = [], []
+cash = INIT_CASH
+equity_val = INIT_CASH
+trades = []
+
+i = 0
+while i < N:
+    if not in_position:
+        if p_up[i] > PROB_THRESH and open1[i] > 0:
+            # 买入
+            position_shares = cash / open1[i]
+            entry_idx = i
+            entry_price = open1[i]
+            entry_date  = dates.iloc[i]
+            cash = 0.0
+            in_position = True
+
+            day_ret = (close1[i] / open1[i]) - 1.0
+            equity_val *= (1.0 + day_ret)
+            daily_returns.append(day_ret)
+            equity_curve.append(equity_val)
+            i += 1
+            continue
+
+        equity_curve.append(equity_val)
+        daily_returns.append(0.0)
+        i += 1
+        continue
+
+    held_days = i - entry_idx + 1
+    if i > entry_idx:
+        prev_close = close1[i-1]
+        day_ret = (close1[i] / prev_close) - 1.0 if prev_close > 0 else 0.0
+        equity_val *= (1.0 + day_ret)
+        daily_returns.append(day_ret)
+        equity_curve.append(equity_val)
+
+    if (held_days % REBAL_DAYS) == 0:
+        if p_up[i] > PROB_THRESH:
+            i += 1
+            continue
+        else:
+            exit_idx = i
+            exit_price = close1[i]
+            exit_date  = dates.iloc[i]
+            trade_ret = (exit_price / entry_price) - 1.0
+
+            cash = equity_val
+            in_position = False
+            trades.append({
+                "entry_date": entry_date.strftime("%Y-%m-%d"),
+                "exit_date": exit_date.strftime("%Y-%m-%d"),
+                "held_days": int(held_days),
+                "trade_return": round(trade_ret, 6)
+            })
+            i += 1
+            continue
+    i += 1
+
+equity_curve = np.array(equity_curve, dtype=float)
+daily_returns = np.array(daily_returns, dtype=float)
+
+# =================== 基准（买入并持有） ===================
+bench_daily = np.zeros(N, dtype=float)
+bench_daily[0] = 0.0
+for k in range(1, N):
+    bench_daily[k] = (close1[k] / close1[k-1]) - 1.0 if close1[k-1] > 0 else 0.0
+bench_equity = INIT_CASH * np.cumprod(1.0 + bench_daily)
+
+# =================== 指标 ===================
+ann_ret = annualized_return_from_curve(equity_curve, dates)
+sharpe = sharpe_ratio(daily_returns)
+mdd    = max_drawdown(equity_curve)
+bench_ann_ret = annualized_return_from_curve(bench_equity, dates)
+alpha  = ann_ret - bench_ann_ret
+
+df_metrics = pd.DataFrame([
+    ["Sharpe Ratio", f"{sharpe:.6f}"],
+    ["Max_Drawdown", f"{mdd:.6%}"],
+    ["Alpha", f"{alpha:.6%}"],
+    ["Annualized return", f"{ann_ret:.6%}"]
+], columns=["指标", "值"])
+df_metrics.to_csv(os.path.join(OUT_DIR, "metrics.csv"), index=False, encoding="utf-8-sig")
+
+# =================== 净值导出 ===================
+df_curve = pd.DataFrame({
+    "date": dates.dt.strftime("%Y-%m-%d"),
+    "equity": equity_curve,
+    "benchmark_equity": bench_equity
+})
+df_curve.to_csv(os.path.join(OUT_DIR, "equity_curve.csv"), index=False, encoding="utf-8-sig")
+
+df_net = pd.DataFrame({
+    "date": df_curve["date"],
+    "strategy_net": df_curve["equity"] / INIT_CASH,
+    "benchmark_net": df_curve["benchmark_equity"] / INIT_CASH
+})
+df_net.to_csv(os.path.join(OUT_DIR, "netvalue_curve.csv"), index=False, encoding="utf-8-sig")
+
+# =================== 绘制净值曲线 ===================
+plt.figure(figsize=(10,5.5), facecolor="white")
+plt.plot(pd.to_datetime(df_net["date"]), df_net["strategy_net"],
+         color="red", label="Strategy Net Worth", linewidth=1.5)
+plt.plot(pd.to_datetime(df_net["date"]), df_net["benchmark_net"],
+         color="black", label="Performance Benchmark", linewidth=1.3)
+plt.plot(pd.to_datetime(df_net["date"]), df_net["strategy_net"], "o", color="red", markersize=2, alpha=0.7)
+plt.plot(pd.to_datetime(df_net["date"]), df_net["benchmark_net"], "o", color="black", markersize=2, alpha=0.7)
+
+plt.gca().xaxis.set_major_locator(mdates.DayLocator(interval=15))
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+plt.xticks(rotation=45, ha="right", fontsize=4)
+
+plt.xlabel("Date")
+plt.ylabel("Net Value (Normalized)")
+plt.title("Strategy vs Benchmark Performance")
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "strategy_vs_benchmark.png"), dpi=300, facecolor="white")
+plt.close()
+print("✅ 回测完成，结果保存在：", OUT_DIR)
+print(df_metrics)
