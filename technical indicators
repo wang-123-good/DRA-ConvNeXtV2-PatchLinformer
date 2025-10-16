@@ -1,0 +1,136 @@
+# -*- coding: utf-8 -*-
+import pandas as pd
+import numpy as np
+import os
+
+# ---------- Helpers: robust column detection ----------
+POSSIBLE_NAMES = {
+    "date": ["date", "datetime", "time", "交易日期", "时间"],
+    "open": ["open", "opening price", "始値", "开盘", "open_price"],
+    "high": ["high", "高", "最高", "high_price"],
+    "low":  ["low", "低", "最低", "low_price"],
+    "close":["close", "closing price", "收盘", "收盘价", "終値", "close_price", "adj close", "adj_close"],
+    "vol":  ["volume", "vol", "成交量", "出来高", "成交额", "turnover"]
+}
+
+def find_col(cols, keys):
+    cols_lower = {c.lower(): c for c in cols}
+    for k in keys:
+        lk = k.lower()
+        if lk in cols_lower:
+            return cols_lower[lk]
+    # fuzzy: try contains match
+    for c in cols:
+        lc = c.lower()
+        for k in keys:
+            if k.lower() in lc:
+                return c
+    return None
+
+# ---------- Technical indicators (no TA-Lib needed) ----------
+def ema(s: pd.Series, span: int):
+    return s.ewm(span=span, adjust=False).mean()
+
+def rsi(series: pd.Series, period: int = 12):
+    delta = series.diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=series.index).ewm(alpha=1/period, adjust=False).mean()
+    roll_down = pd.Series(down, index=series.index).ewm(alpha=1/period, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+def momentum(series: pd.Series, period: int = 5):
+    return series.diff(period)
+
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+def stochastic_kdj(high: pd.Series, low: pd.Series, close: pd.Series,
+                   fastk_period: int = 9, slowk_period: int = 5, slowd_period: int = 5):
+    ll = low.rolling(window=fastk_period, min_periods=fastk_period).min()
+    hh = high.rolling(window=fastk_period, min_periods=fastk_period).max()
+    fast_k = (close - ll) / (hh - ll + 1e-12) * 100.0  # 0~100
+    K = fast_k.rolling(window=slowk_period, min_periods=slowk_period).mean()
+    D = K.rolling(window=slowd_period, min_periods=slowd_period).mean()
+    J = 3.0 * K - 2.0 * D
+    return K, D, J
+
+# ---------- Main feature builder ----------
+def cal_feature(df: pd.DataFrame) -> pd.DataFrame:
+    # normalize key columns
+    open_col  = find_col(df.columns, POSSIBLE_NAMES["open"])
+    high_col  = find_col(df.columns, POSSIBLE_NAMES["high"])
+    low_col   = find_col(df.columns, POSSIBLE_NAMES["low"])
+    close_col = find_col(df.columns, POSSIBLE_NAMES["close"])
+    vol_col   = find_col(df.columns, POSSIBLE_NAMES["vol"])
+
+    if not all([open_col, high_col, low_col, close_col]):
+        raise ValueError(f"无法定位关键列，请检查表头。检测到的列：{df.columns.tolist()}")
+
+    # Copy to canonical names
+    df = df.copy()
+    df.rename(columns={open_col:"open", high_col:"high", low_col:"low", close_col:"close"}, inplace=True)
+    if vol_col:
+        df.rename(columns={vol_col:"vol"}, inplace=True)
+    else:
+        # 如果没有成交量列，用 NaN 占位
+        df["vol"] = np.nan
+
+    # 1) 收益率
+    df["1_day_Return"]  = df["close"].pct_change()
+
+    df["10_day_Return"] = df["close"].pct_change(10)
+    df["future_10d_return"] = df["close"].shift(-10) / df["close"] - 1
+
+    # 2) 波动（过去30日收益率标准差）
+    df["SD"] = df["1_day_Return"].rolling(window=30, min_periods=30).std()
+
+    # 3) 偏度（过去30日收益率）
+    df["skewness"] = df["1_day_Return"].rolling(window=30, min_periods=30).skew()
+
+    # 4) 成交量增长率
+    df["pct_vol"] = df["vol"].pct_change()
+
+    # 6) 均线
+    df["MA5"]  = df["close"].rolling(5,  min_periods=5).mean()
+    df["MA10"] = df["close"].rolling(10, min_periods=10).mean()
+
+    # 7) 技术指标（RSI/MOM/EMA/MACD/KDJ 等）
+    df["RSI"]   = rsi(df["close"], period=12)
+    df["MOM"]   = momentum(df["close"], period=5)
+    df["EMA12"] = ema(df["close"], span=12)
+    macd_line, macd_signal, macd_hist = macd(df["close"], fast=12, slow=26, signal=9)
+    df["MACD"]       = macd_line
+
+    K, D, J = stochastic_kdj(df["high"], df["low"], df["close"],
+                             fastk_period=9, slowk_period=5, slowd_period=5)
+    df["K"] = K
+    df["D"] = D
+    df["J"] = J
+
+
+    df = df.dropna().reset_index(drop=True)
+    return df
+
+# --------- Load input, compute features, save ----------
+if __name__ == "__main__":
+    in_path = "HR.xlsx"  # 示例：Excel 文件
+    out_path = "HR_with_features.csv"
+
+    if not os.path.exists(in_path):
+        raise FileNotFoundError(f"找不到输入文件：{in_path}")
+
+    if in_path.lower().endswith((".xlsx", ".xls")):
+        df_in = pd.read_excel(in_path)
+    else:
+        df_in = pd.read_csv(in_path)
+
+    df_feat = cal_feature(df_in)
+    df_feat.to_csv(out_path, index=False, encoding="utf-8-sig")
+    print(f"已保存: {out_path}")
