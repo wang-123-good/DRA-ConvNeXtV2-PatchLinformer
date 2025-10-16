@@ -1,0 +1,1005 @@
+import os, time, json, math, random, copy, warnings
+import numpy as np, pandas as pd
+import torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report, f1_score
+import matplotlib.pyplot as plt
+
+# ==================== 全局可调参数 ====================
+data_root   = "processed"
+out_dir     = "./dra_convnextv2_patchlinformer"
+os.makedirs(out_dir, exist_ok=True)
+
+seed              = 42
+BASE_EPOCHS       = 100
+BASE_BATCH        = 128
+PATIENCE_ES       = 15
+BASE_WEIGHT_DECAY = 5e-4
+BASE_MIN_LR       = 1e-6
+WARMUP_RATIO      = 0.05
+
+# 训练增强
+gauss_noise_std = 0.01
+time_mask_prob  = 0.15
+time_mask_max   = 2
+
+# ===== 二分类设置 =====
+num_classes      = 2
+table_floatfmt   = ".4f"
+max_mis_plots    = 6
+features_to_show = 3
+
+# ==================== DRA 搜索配置（真·DRA） ====================
+# 总个体数 = DRA_COMMUNITIES * DRA_COMM_SIZE（若与 DRA_POP 不一致，以前者为准）
+DRA_COMMUNITIES  = 2         # 宗派/学校数量（>=2 更有跨派交流效果）
+DRA_COMM_SIZE    = 6         # 每派人数（含领袖/传教士/信徒）
+DRA_POP          = DRA_COMMUNITIES * DRA_COMM_SIZE
+DRA_GEN          = 6         # 最大迭代代数（建议先小试，找到趋势再拉长）
+
+# 机制开关/超参
+DRA_TOP_MISSION  = 2         # 每派“传教士”人数（除去领袖）
+PROMOTION_RATE   = 0.60      # 推广：朝领袖/传教士靠拢的强度上限（随退火缩放）
+MIRACLE_PROB     = 0.08      # 奇迹：大步长跃迁/跨派重组的概率
+SUBSTITUTION_FR  = 0.20      # 替换：每代按该比例替换本派最差个体（0~1）
+REWARD_ALPHA     = 0.20      # 奖励：提升则步长 *= (1 + ALPHA * 退火因子)
+PENALTY_BETA     = 0.15      # 惩罚：退步则步长 *= (1 - BETA  * 退火因子)
+STEP_MIN, STEP_MAX = 0.03, 0.50 # 个体步长（含向量噪声）的上下限
+MAX_STALL_GENS   = 2         # 流放：连续劣化/停滞的代数阈值（≥该阈值强制替换）
+
+FAST_EPOCHS      = 4         # 单次评估快速训练 epoch
+NO_IMPROVE_PATI  = 2         # 代际早停：全局最优 no-improve 连续阈值
+
+# DataLoader 加速参数
+NUM_WORKERS       = max(2, os.cpu_count() // 2)
+PIN_MEMORY        = True
+PERSISTENT_WORKER = True
+PREFETCH_FACTOR   = 4
+
+# === 回测导出：列名候选（用于自动识别日期/价格列） ===
+DATE_CANDIDATES  = ["Date","date","交易日期","时间","Datetime","datetime","日期"]
+OPEN_CANDIDATES  = ["Open","open","开盘","开盘价","OPEN"]
+CLOSE_CANDIDATES = ["Close","close","收盘","收盘价","CLOSE"]
+HIGH_CANDIDATES  = ["High","high","最高","最高价","HIGH"]
+LOW_CANDIDATES   = ["Low","low","最低","最低价","LOW"]
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if device.type == "cuda":
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+warnings.filterwarnings("ignore")
+
+def set_seed(s=42):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s);
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(s)
+set_seed(seed)
+
+# ==================== 数据集与加载 ====================
+class SeqClsDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = X.astype(np.float32)  # [N, L, D]
+        self.y = y.astype(np.int64)
+    def __len__(self): return self.X.shape[0]
+    def __getitem__(self, idx): return self.X[idx], self.y[idx]
+
+def make_loader(X, y, batch, shuffle, drop_last=False):
+    return DataLoader(
+        SeqClsDataset(X, y), batch_size=batch, shuffle=shuffle, drop_last=drop_last,
+        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKER,
+        prefetch_factor=PREFETCH_FACTOR
+    )
+
+def load_data(root):
+    X_train = np.load(os.path.join(root, "X_train.npy"))
+    y_train = np.load(os.path.join(root, "y_train.npy"))
+    X_val   = np.load(os.path.join(root, "X_val.npy"))
+    y_val   = np.load(os.path.join(root, "y_val.npy"))
+    X_test  = np.load(os.path.join(root, "X_test.npy"))
+    y_test  = np.load(os.path.join(root, "y_test.npy"))
+    return (X_train, y_train, X_val, y_val, X_test, y_test)
+
+# ==================== 小工具（回测导出用） ====================
+def _detect_col(cols, candidates):
+    lowers = {c.lower(): c for c in cols}
+    for k in candidates:
+        if k.lower() in lowers: return lowers[k.lower()]
+    for c in cols:
+        lc = c.lower()
+        for k in candidates:
+            if k.lower() in lc: return c
+    return None
+
+def _parse_meta(meta_csv_path, default_seq_len, default_stride=1):
+    seq_len_meta, stride_meta = None, None
+    if os.path.exists(meta_csv_path):
+        try:
+            dfm = pd.read_csv(meta_csv_path)
+            row0 = dfm.iloc[0].to_dict()
+            if "seq_len" in row0: seq_len_meta = int(row0["seq_len"])
+            if "stride"  in row0: stride_meta  = int(row0["stride"])
+        except Exception:
+            pass
+    if seq_len_meta is None: seq_len_meta = int(default_seq_len)
+    if stride_meta  is None: stride_meta  = int(default_stride)
+    return seq_len_meta, stride_meta
+
+def _rows_from_windows(n_win, T, st):
+    return (int(n_win) - 1) * int(st) + int(T)
+
+# ==================== 工具模块：DropPath / LN(通道后) ====================
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__(); self.drop_prob = float(drop_prob)
+    def forward(self, x: torch.Tensor):
+        if self.drop_prob == 0.0 or not self.training: return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+class LayerNormChannelsLast1D(nn.Module):
+    def __init__(self, num_channels, eps=1e-6):
+        super().__init__(); self.ln = nn.LayerNorm(num_channels, eps=eps)
+    def forward(self, x):  # [B,C,L]
+        return self.ln(x.transpose(1,2)).transpose(1,2)
+
+# ==================== ConvNeXt V2 Block / Front (1D) ====================
+class ConvNeXtV2Block1D(nn.Module):
+    def __init__(self, dim, kernel_size=7, drop_path=0.0, layerscale_init=1e-6):
+        super().__init__()
+        pad = (kernel_size - 1) // 2
+        self.dwconv = nn.Conv1d(dim, dim, kernel_size, padding=pad, groups=dim)
+        self.ln = LayerNormChannelsLast1D(dim)
+        self.pw1 = nn.Conv1d(dim, 4*dim, 1)
+        self.act = nn.GELU()
+        self.pw2 = nn.Conv1d(4*dim, dim, 1)
+        self.gamma = nn.Parameter(layerscale_init * torch.ones(dim), requires_grad=True)
+        self.dp = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+    def forward(self, x):  # [B,C,L]
+        h = self.dwconv(x); h = self.ln(h); h = self.pw1(h); h = self.act(h); h = self.pw2(h)
+        h = h * self.gamma.view(1,-1,1)
+        return x + self.dp(h)
+
+class ConvNeXtV2Front1D(nn.Module):
+    def __init__(self, dim=128, depth=4, kernel_size=7, drop_path=0.1, layerscale_init=1e-6):
+        super().__init__()
+        self.stem = nn.Conv1d(1, dim, 3, padding=1)
+        dpr = torch.linspace(0, drop_path, steps=depth).tolist() if depth>0 else []
+        self.blocks = nn.Sequential(*[
+            ConvNeXtV2Block1D(dim, kernel_size=kernel_size, drop_path=dpr[i], layerscale_init=layerscale_init)
+            for i in range(depth)
+        ])
+        self.head = nn.Conv1d(dim, 1, 1)
+    def forward(self, x_single):  # [B,L]
+        x = x_single.unsqueeze(1); res = x
+        x = self.stem(x); x = self.blocks(x); x = self.head(x)
+        return (x + res).squeeze(1)
+
+# ==================== Patch 嵌入 ====================
+class PatchEmbedding1D(nn.Module):
+    def __init__(self, seq_len, patch_len, stride, d_model, dropout=0.0, use_cls_token=True):
+        super().__init__()
+        assert patch_len>0 and stride>0
+        n_patches = 1 + (seq_len - patch_len) // stride
+        if n_patches <= 0: raise ValueError("patch_len/stride 参数不合适，无法切出 patch。")
+        self.patch_len, self.stride, self.use_cls_token = patch_len, stride, use_cls_token
+        token_count = n_patches + (1 if use_cls_token else 0)
+        self.proj = nn.Linear(patch_len, d_model)
+        self.pos  = nn.Parameter(torch.zeros(1, token_count, d_model))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        self.cls  = nn.Parameter(torch.zeros(1,1,d_model)) if use_cls_token else None
+        if self.cls is not None: nn.init.trunc_normal_(self.cls, std=0.02)
+        self.drop = nn.Dropout(dropout)
+        self.token_count = token_count
+
+    def forward(self, x_single):  # [B,L]
+        B, L = x_single.shape
+        starts = torch.arange(0, L - self.patch_len + 1, self.stride, device=x_single.device)
+        gather_idx = starts[:, None] + torch.arange(self.patch_len, device=x_single.device)[None, :]
+        patches = x_single[:, gather_idx]          # [B,Tk,patch_len]
+        x = self.proj(patches)                     # [B,Tk,d_model]
+        if self.use_cls_token: x = torch.cat([self.cls.expand(B,-1,-1), x], dim=1)
+        x = x + self.pos
+        return self.drop(x)
+
+# ==================== Linformer 编码器 ====================
+class LinformerSelfAttention(nn.Module):
+    """
+    Q,K,V: [B,T,D]；使用可学习 E_K/E_V: [T,k] 将时间维 T 投影到 k，再做多头注意力。
+    """
+    def __init__(self, d_model, n_heads, proj_len_k, token_count, attn_drop=0.0):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head  = d_model // n_heads
+        self.scale   = self.d_head ** -0.5
+        self.proj_qkv = nn.Linear(d_model, 3 * d_model, bias=True)
+        self.E_k = nn.Parameter(torch.randn(token_count, proj_len_k) * (1.0 / math.sqrt(token_count)))
+        self.E_v = nn.Parameter(torch.randn(token_count, proj_len_k) * (1.0 / math.sqrt(token_count)))
+        self.o_proj = nn.Linear(d_model, d_model, bias=True)
+        self.attn_drop = nn.Dropout(attn_drop)
+
+    def forward(self, x):  # x:[B,T,D]
+        B, T, D = x.shape
+        qkv = self.proj_qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)                            # [B,T,D]x3
+        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k_lin = torch.einsum("bhtd,tk->bhkd", k, self.E_k)          # [B,H,k,d_h]
+        v_lin = torch.einsum("bhtd,tk->bhkd", v, self.E_v)          # [B,H,k,d_h]
+        attn_scores = torch.matmul(q, k_lin.transpose(-2, -1)) * self.scale  # [B,H,T,k]
+        attn = F.softmax(attn_scores, dim=-1)
+        attn = self.attn_drop(attn)
+        ctx = torch.matmul(attn, v_lin)                             # [B,H,T,d_h]
+        ctx = ctx.transpose(1, 2).contiguous().view(B, T, D)        # [B,T,D]
+        return self.o_proj(ctx)
+
+class LinformerEncoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, proj_len_k, token_count, dim_ff, attn_drop=0.0, ff_drop=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn  = LinformerSelfAttention(d_model, n_heads, proj_len_k, token_count, attn_drop)
+        self.drop1 = nn.Dropout(ff_drop)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn   = nn.Sequential(
+            nn.Linear(d_model, dim_ff),
+            nn.GELU(),
+            nn.Dropout(ff_drop),
+            nn.Linear(dim_ff, d_model),
+        )
+        self.drop2 = nn.Dropout(ff_drop)
+    def forward(self, x):  # [B,T,D]
+        h = self.attn(self.norm1(x)); x = x + self.drop1(h)
+        h = self.ffn(self.norm2(x));  x = x + self.drop2(h)
+        return x
+
+class LinformerEncoder(nn.Module):
+    def __init__(self, depth, d_model, n_heads, proj_len_k, token_count, dim_ff, attn_drop=0.0, ff_drop=0.0):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            LinformerEncoderLayer(d_model, n_heads, proj_len_k, token_count, dim_ff, attn_drop, ff_drop)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(d_model)
+    def forward(self, x):  # [B,T,D]
+        for blk in self.layers:
+            x = blk(x)
+        return self.norm(x)
+
+# ==================== 通道聚合 ====================
+class ChannelAggregator(nn.Module):
+    def __init__(self, d_model, mode="attn", dropout=0.0):  # 默认改为 "attn"
+        super().__init__(); self.mode = mode
+        if mode == "attn":
+            self.q = nn.Linear(d_model, d_model); self.k = nn.Linear(d_model, d_model)
+            self.v = nn.Linear(d_model, d_model); self.drop = nn.Dropout(dropout); self.scale = math.sqrt(d_model)
+    def forward(self, x):  # x:[B,D,d_model]
+        if self.mode == "mean": return x.mean(dim=1)
+        Q = self.q(x); K = self.k(x); V = self.v(x)
+        attn = torch.matmul(Q, K.transpose(-2,-1)) / self.scale
+        attn = F.softmax(attn, dim=-1); attn = self.drop(attn)
+        return torch.matmul(attn, V).mean(dim=1)
+
+# ==================== 整体模型 ====================
+class ConvNeXtV2_PatchLinformer_Classifier(nn.Module):
+    def __init__(self, seq_len, d_in, num_classes,
+                 cnx_dim=128, cnx_depth=4, cnx_kernel=7, cnx_drop_path=0.1, cnx_layerscale=1e-6,
+                 patch_len=8, stride=4, d_model=256,
+                 lin_heads=4, lin_layers=3, lin_k=32, dim_ff=256,
+                 dropout=0.1, use_cls_token=True, channel_agg="attn"):
+        super().__init__()
+        self.seq_len = seq_len; self.d_in = d_in
+        self.front   = ConvNeXtV2Front1D(cnx_dim, cnx_depth, cnx_kernel, cnx_drop_path, cnx_layerscale)
+        self.embed   = PatchEmbedding1D(seq_len, patch_len, stride, d_model, dropout, use_cls_token)
+        self.encoder = LinformerEncoder(
+            depth=lin_layers, d_model=d_model, n_heads=lin_heads,
+            proj_len_k=lin_k, token_count=self.embed.token_count, dim_ff=dim_ff,
+            attn_drop=dropout, ff_drop=dropout
+        )
+        self.use_cls_token = use_cls_token
+        self.agg     = ChannelAggregator(d_model, mode=channel_agg, dropout=dropout)
+        self.head    = nn.Linear(d_model, num_classes)
+
+    def forward(self, x):  # [B,L,D]
+        B,L,D = x.shape; assert L == self.seq_len and D == self.d_in
+        x_cd = x.permute(0,2,1).contiguous().view(B*D, L)      # [B*D, L]
+        x_cd = self.front(x_cd)                                 # [B*D, L]
+        z    = self.embed(x_cd)                                 # [B*D, Tk(+1), d_model]
+        z    = self.encoder(z)                                  # [B*D, Tk(+1), d_model]
+        z    = z[:,0,:] if self.use_cls_token else z.mean(dim=1)
+        H    = z.view(B, D, -1)                                 # [B, D, d_model]
+        return self.head(self.agg(H))                           # [B, 2]
+
+# ==================== 评估/可视化（按二分类 + macro-F1） ====================
+def add_train_time_aug(x_tensor):
+    if gauss_noise_std > 0: x_tensor = x_tensor + gauss_noise_std * torch.randn_like(x_tensor)
+    if time_mask_prob > 0:
+        B,L,D = x_tensor.shape
+        for b in range(B):
+            if random.random() < time_mask_prob:
+                m = random.randint(1, time_mask_max)
+                st = random.randint(0, max(0, L-m))
+                x_tensor[b, st:st+m, :] = 0.0
+    return x_tensor
+
+def softmax_np(logits):
+    z = logits - logits.max(axis=1, keepdims=True); e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
+    all_logits, all_y, loss_sum, n = [], [], 0.0, 0
+    ce = nn.CrossEntropyLoss(reduction="sum")
+    amp_enabled = (device.type == "cuda")
+    for Xb, yb in loader:
+        if PIN_MEMORY:
+            Xb = Xb.cuda(non_blocking=True) if device.type=="cuda" else Xb.to(device)
+            yb = yb.cuda(non_blocking=True) if device.type=="cuda" else yb.to(device)
+        else:
+            Xb = Xb.to(device); yb = yb.to(device)
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            logits = model(Xb); loss = ce(logits, yb)
+        loss_sum += loss.item(); n += Xb.size(0)
+        all_logits.append(logits.detach().cpu().numpy())
+        all_y.append(yb.detach().cpu().numpy())
+
+    all_logits = np.concatenate(all_logits, axis=0) if all_logits else np.zeros((0, num_classes))
+    all_y = np.concatenate(all_y, axis=0) if all_y else np.zeros((0,), dtype=int)
+    preds = all_logits.argmax(axis=1)
+    avg_loss = loss_sum / max(1, n); acc = accuracy_score(all_y, preds)
+    prec, rec, f1, _ = precision_recall_fscore_support(all_y, preds, labels=[0,1], zero_division=0)
+    macro_f1 = f1_score(all_y, preds, average="macro", zero_division=0)
+    metrics = {
+        "loss": avg_loss, "accuracy": acc, "macro_f1": macro_f1,
+        "precision_class0": prec[0], "recall_class0": rec[0], "f1_class0": f1[0],
+        "precision_class1": prec[1], "recall_class1": rec[1], "f1_class1": f1[1],
+    }
+    return metrics, preds, all_logits, all_y
+
+def plot_confusion_percent(y_true, y_pred, save_path, labels=("Down(0)","Up(1)")):
+    cm = confusion_matrix(y_true, y_pred, labels=[0,1]).astype(np.float64)
+    row_sums = cm.sum(axis=1, keepdims=True); row_sums[row_sums == 0] = 1.0
+    cm_pct = cm / row_sums * 100.0
+    plt.figure(figsize=(5.2,4.4))
+    plt.imshow(cm_pct, interpolation='nearest', cmap='Blues')
+    plt.colorbar(fraction=0.046, pad=0.04)
+    ticks = np.arange(len(labels)); plt.xticks(ticks, labels); plt.yticks(ticks, labels)
+    thr = cm_pct.max()/2.0 if cm_pct.size>0 else 50.0
+    for i in range(cm_pct.shape[0]):
+        for j in range(cm_pct.shape[1]):
+            txt = f"{cm_pct[i,j]:.1f}%"
+            plt.text(j,i,txt,ha="center",va="center",color="white" if cm_pct[i,j]>thr else "black")
+    plt.ylabel("True"); plt.xlabel("Predicted"); plt.tight_layout(); plt.savefig(save_path, dpi=300); plt.savefig(save_path, dpi=300, bbox_inches="tight");plt.close()
+
+def plot_curves(history, save_loss_path, save_acc_path, save_f1_path):
+    df = pd.DataFrame(history)
+    # loss
+    plt.figure(figsize=(7,5))
+    plt.plot(df["epoch"], df["train_loss"], label="train_loss")
+    plt.plot(df["epoch"], df["val_loss"], label="val_loss")
+    plt.xlabel("epoch"); plt.ylabel("loss"); plt.legend()
+    plt.tight_layout(); plt.savefig(save_loss_path, dpi=300); plt.close()
+    # acc
+    if "train_acc" in df.columns and "val_acc" in df.columns:
+        plt.figure(figsize=(7,5))
+        plt.plot(df["epoch"], df["train_acc"], label="train_acc")
+        plt.plot(df["epoch"], df["val_acc"], label="val_acc")
+        plt.xlabel("epoch"); plt.ylabel("accuracy"); plt.legend()
+        plt.tight_layout(); plt.savefig(save_acc_path, dpi=300); plt.close()
+    # macro-F1
+    if "train_macro_f1" in df.columns and "val_macro_f1" in df.columns:
+        plt.figure(figsize=(7,5))
+        plt.plot(df["epoch"], df["train_macro_f1"], label="train_macro_f1")
+        plt.plot(df["epoch"], df["val_macro_f1"], label="val_macro_f1")
+        plt.xlabel("epoch"); plt.ylabel("macro-F1"); plt.legend()
+        plt.tight_layout(); plt.savefig(save_f1_path, dpi=300); plt.close()
+
+def plot_prob_histograms(y_true, logits, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    probs = softmax_np(logits)
+    for c in range(probs.shape[1]):
+        p = probs[:, c]; idx_c = (y_true==c); idx_not = ~idx_c
+        plt.figure(figsize=(7,5))
+        plt.hist(p[idx_c], bins=30, alpha=0.65, label=f"True class = {c}")
+        plt.hist(p[idx_not], bins=30, alpha=0.65, label=f"True class != {c}")
+        plt.xlabel(f"Predicted probability for class {c}")
+        plt.ylabel("Count"); plt.title(f"Probability Histogram - Class {c}")
+        plt.legend(); plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f"prob_hist_class_{c}.png"), dpi=300); plt.close()
+
+def plot_misclassified_examples(X, y_true, y_pred, save_dir, max_plots=6, features_to_show=3):
+    os.makedirs(save_dir, exist_ok=True)
+    mis_idx = np.where(y_true != y_pred)[0]
+    if mis_idx.size == 0:
+        plt.figure(figsize=(6,3)); plt.text(0.5,0.5,"No misclassified samples.",ha="center",va="center")
+        plt.axis("off"); plt.tight_layout()
+        plt.savefig(os.path.join(save_dir,"misclassified_none.png"), dpi=300); plt.close(); return
+    pick = mis_idx[:max_plots]
+    for k,i in enumerate(pick):
+        seq = X[i]; L,D = seq.shape; fmax = min(features_to_show, D)
+        plt.figure(figsize=(7,4))
+        for f in range(fmax): plt.plot(range(L), seq[:,f], label=f"Feature {f}")
+        plt.title(f"Misclassified #{k+1} (idx={i}) | True={y_true[i]} Pred={y_pred[i]}")
+        plt.xlabel("Time step"); plt.ylabel("Standardized value"); plt.legend()
+        plt.tight_layout(); plt.savefig(os.path.join(save_dir, f"mis_sample_{k+1}.png"), dpi=300); plt.close()
+
+def save_metrics_table_binary(precs, recs, f1s, acc, macro_f1, loss, save_csv, save_png, floatfmt=".4f"):
+    columns = ["DOWN(0)", "UP(1)"]
+    df = pd.DataFrame({"row": ["Precision","Recall","F1-Measure","Accuracy","Macro-F1","LOSS"]}).set_index("row")
+    df[columns[0]] = [precs[0], recs[0], f1s[0], acc, macro_f1, loss]
+    df[columns[1]] = [precs[1], recs[1], f1s[1], acc, macro_f1, loss]
+    df.to_csv(save_csv, encoding="utf-8-sig")
+    fig, ax = plt.subplots(figsize=(7.0, 3.0)); ax.axis("off")
+    table_data = [[f"{v:{floatfmt}}" for v in df.loc[row, columns].values] for row in df.index]
+    table = ax.table(cellText=table_data, rowLabels=df.index.tolist(), colLabels=columns,
+                     loc="center", cellLoc="center", rowLoc="center")
+    table.auto_set_font_size(False); table.set_fontsize(10); table.scale(1.15, 1.15)
+    for (row, col), cell in table.get_celld().items():
+        if row == 0: cell.set_text_props(weight="bold")
+        if col == -1: cell.set_text_props(weight="bold")
+    plt.tight_layout(); plt.savefig(save_png, dpi=300); plt.close()
+    widths = [12, 12, 12]
+    header = ["", *columns]; print("".join(h.ljust(w) for h, w in zip(header, widths)))
+    for row in df.index:
+        vals = [row] + [f"{df.at[row, c]:{floatfmt}}" for c in columns]
+        print("".join(v.ljust(w) for v, w in zip(vals, widths)))
+
+# ==================== 单次快速训练（用于 DRA 搜索） ====================
+def train_eval_once(params, Xtr, ytr, Xva, yva, fast_epochs=FAST_EPOCHS, batch=128, weight_decay=5e-4, lr=3e-4):
+    torch.cuda.empty_cache()
+    L, D = Xtr.shape[1], Xtr.shape[2]
+    model = ConvNeXtV2_PatchLinformer_Classifier(
+        seq_len=L, d_in=D, num_classes=num_classes,
+        cnx_dim=params["cnx_dim"], cnx_depth=params["cnx_depth"], cnx_kernel=params["cnx_kernel"],
+        cnx_drop_path=params["cnx_drop_path"], cnx_layerscale=1e-6,
+        patch_len=params["patch_len"], stride=params["stride"], d_model=params["d_model"],
+        lin_heads=params["lin_heads"], lin_layers=params["lin_layers"], lin_k=params["lin_k"], dim_ff=params["dim_ff"],
+        dropout=params["dropout"], use_cls_token=True, channel_agg="attn"
+    ).to(device)
+
+    dl_tr = make_loader(Xtr, ytr, batch=batch, shuffle=True)
+    dl_va = make_loader(Xva, yva, batch=batch, shuffle=False)
+
+    criterion = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type=="cuda"))
+    amp_enabled = (device.type == "cuda")
+
+    best_macro_f1, best_state = -1.0, None
+    for ep in range(1, fast_epochs+1):
+        model.train()
+        for Xb, yb in dl_tr:
+            if PIN_MEMORY:
+                Xb = Xb.cuda(non_blocking=True) if device.type=="cuda" else Xb.to(device)
+                yb = yb.cuda(non_blocking=True) if device.type=="cuda" else yb.to(device)
+            else:
+                Xb = Xb.to(device); yb = yb.to(device)
+            Xb = add_train_time_aug(Xb)
+            opt.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                logits = model(Xb); loss = criterion(logits, yb)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt); scaler.update()
+
+        va_metrics, _, _, _ = evaluate(model, dl_va, device)
+        if va_metrics["macro_f1"] > best_macro_f1 + 1e-6:
+            best_macro_f1 = va_metrics["macro_f1"]
+            best_state = copy.deepcopy(model.state_dict())
+
+    if best_state is not None: model.load_state_dict(best_state)
+    va_metrics, _, _, _ = evaluate(model, dl_va, device)
+    return float(va_metrics["macro_f1"]), va_metrics
+
+# ==================== 真·DRA 优化器 & 搜索空间 ====================
+def sp_int(u, lo, hi):   return int(np.round(lo + u*(hi-lo)))
+def sp_choice(u, choices):
+    idx = int(np.floor(u * len(choices))); idx = min(idx, len(choices)-1); return choices[idx]
+def sp_float(u, lo, hi): return float(lo + u*(hi-lo))
+
+def decode_vector(u, seq_len):
+    choices_patch   = [4,6,8,10,12,14,16]
+    choices_stride  = [2,3,4,5,6,8]
+    choices_dmodel  = [128,192,256,320,384]
+    choices_heads   = [4,8]
+    choices_layers  = [2,3,4,5,6]
+    choices_lin_k   = [16,24,32,48,64]
+    choices_dim_ff  = [256,384,512,640,768]
+    choices_cnx_dim = [96,128,160,192,224,256]
+    choices_kernel  = [5,7,9,11]
+    choices_bs      = [64,96,128,160,192]
+
+    patch_len = sp_choice(u[0], choices_patch)
+    stride    = sp_choice(u[1], choices_stride)
+    if seq_len - patch_len < 0:
+        patch_len = max([p for p in choices_patch if p <= seq_len] or [min(choices_patch)])
+
+    d = {
+        "patch_len": patch_len,
+        "stride":    stride,
+        "d_model":   sp_choice(u[2], choices_dmodel),
+        "lin_heads": sp_choice(u[3], choices_heads),
+        "lin_layers":sp_choice(u[4], choices_layers),
+        "lin_k":     sp_choice(u[5], choices_lin_k),
+        "dim_ff":    sp_choice(u[6], choices_dim_ff),
+        "dropout":   sp_float(u[7], 0.05, 0.30),
+
+        "cnx_dim":   sp_choice(u[8], choices_cnx_dim),
+        "cnx_depth": sp_int(u[9], 2, 6),
+        "cnx_kernel":sp_choice(u[10], choices_kernel),
+        "cnx_drop_path": sp_float(u[11], 0.0, 0.30),
+
+        "lr":          sp_float(u[12], 1e-4, 3e-3),
+        "weight_decay":sp_float(u[13], 1e-5, 5e-4),
+        "batch_size":  sp_choice(u[14], choices_bs),
+    }
+    return d
+
+def vector_dim(): return 15
+
+class TrueDRAOptimizer:
+    """
+    真·DRA：宗派/领袖/传教士/信徒 + 推广/奇迹/替换/奖惩/边界修复 + 退火
+    - 人口：C 个宗派，每派 S 人（含 1 领袖 + M 传教士 + 其余信徒）
+    - 推广：信徒朝领袖/传教士靠拢
+    - 奇迹：低概率大步跃迁/跨派杂交
+    - 替换：每代对最差个体替换（本派内按 SUBSTITUTION_FR 比例）
+    - 奖惩：与前一代成绩比较，自适应调整个体步长
+    - 边界修复：clip + 镜像；并保留少量随机重采样增强探索
+    """
+    def __init__(self, communities, comm_size, dim, max_gen, seed=42):
+        self.C = communities
+        self.S = comm_size
+        self.N = self.C * self.S
+        self.dim = dim
+        self.max_gen = max_gen
+        self.rng = np.random.RandomState(seed)
+
+        # 初始化
+        self.U = self.rng.rand(self.N, self.dim)                   # 决策向量
+        self.steps = self.rng.uniform(STEP_MIN, STEP_MAX, size=(self.N, self.dim))  # 个体步长（向量）
+        self.prev_scores = np.full(self.N, -np.inf, dtype=float)   # 上代得分
+        self.stall = np.zeros(self.N, dtype=int)                   # 连续停滞/劣化计数
+        # 社区划分：顺序分派
+        self.comm_idx = np.repeat(np.arange(self.C), self.S)
+
+    @staticmethod
+    def _clip01(x):
+        return np.clip(x, 0.0, 1.0)
+
+    @staticmethod
+    def _mirror_repair(x):
+        # 先 clip，再镜像修复（越界的量回弹）
+        below = x < 0.0
+        above = x > 1.0
+        x[below] = -x[below]
+        x[above] = 2.0 - x[above]
+        return TrueDRAOptimizer._clip01(x)
+
+    def _anneal(self, gen):
+        # 退火：前期探索大、后期收敛强
+        # 返回 [0,1] 区间系数，前大后小
+        return 1.0 - (gen / max(1, self.max_gen))
+
+    def ask(self):
+        """返回当前种群 U（用于评估）"""
+        return self.U.copy()
+
+    def tell_and_step(self, scores, gen):
+        """
+        根据 scores（越大越好）更新种群，进入下一代
+        """
+        assert len(scores) == self.N
+        tau = self._anneal(gen)  # 退火因子
+
+        # --- 按社区分组，找出每派领袖/传教士/信徒 ---
+        U_new = self.U.copy()
+        steps_new = self.steps.copy()
+        improved_mask = scores > self.prev_scores + 1e-12
+        worse_mask = scores < self.prev_scores - 1e-12
+        equal_mask = ~(improved_mask | worse_mask)
+
+        # 奖惩调整步长（个体级）
+        steps_new[improved_mask] *= (1.0 + REWARD_ALPHA * tau)
+        steps_new[worse_mask]    *= (1.0 - PENALTY_BETA * tau)
+        # 对于不变的个体，轻微收缩
+        steps_new[equal_mask]    *= (1.0 - 0.05 * tau)
+        steps_new = np.clip(steps_new, STEP_MIN, STEP_MAX)
+
+        # 更新 stall 计数并做“流放”
+        self.stall[improved_mask] = 0
+        self.stall[worse_mask | equal_mask] += 1
+
+        for c in range(self.C):
+            idx_c = np.where(self.comm_idx == c)[0]
+            Uc, Sc = self.U[idx_c], scores[idx_c]
+            order = np.argsort(-Sc)  # 降序
+            leader_id = idx_c[order[0]]
+            mission_ids = idx_c[order[1:1+DRA_TOP_MISSION]] if self.S > 1 else np.array([], dtype=int)
+            follower_ids = idx_c[order[1+DRA_TOP_MISSION:]] if self.S > (1+DRA_TOP_MISSION) else np.array([], dtype=int)
+
+            u_leader = self.U[leader_id].copy()
+
+            # --- 推广（exploitation）：信徒朝 领袖/传教士 靠拢 ---
+            for i in follower_ids:
+                u = self.U[i]; s = self.steps[i]
+                # 从传教士中挑一个参考（若无，退化为领袖）
+                if len(mission_ids) > 0:
+                    j = self.rng.choice(mission_ids)
+                    u_m = self.U[j]
+                else:
+                    u_m = u_leader
+
+                a = self.rng.rand(self.dim) * (PROMOTION_RATE * tau)
+                b = self.rng.rand(self.dim) * (PROMOTION_RATE * tau * 0.7)
+                noise = self.rng.normal(0.0, s * 0.5, size=self.dim)   # 探索噪声随步长变动
+
+                v = u + a*(u_leader - u) + b*(u_m - u) + noise
+                # 小概率促进收敛（均衡 exploitation 与 exploration）
+                if self.rng.rand() < 0.3:
+                    v = 0.5*(v + u_leader)
+
+                # 边界修复
+                v = self._mirror_repair(v)
+                U_new[i] = v
+
+            # --- 传教士也进行互学（轻度） ---
+            for i in mission_ids:
+                u = self.U[i]; s = self.steps[i]
+                # 与领袖/同僚交互
+                partner_pool = [pid for pid in mission_ids if pid != i]
+                if len(partner_pool) > 0 and self.rng.rand() < 0.6:
+                    j = self.rng.choice(partner_pool)
+                    peer = self.U[j]
+                else:
+                    peer = u_leader
+                a = self.rng.rand(self.dim) * (0.4 * tau)
+                noise = self.rng.normal(0.0, s * 0.3, size=self.dim)
+                v = u + a*(peer - u) + noise
+                v = self._mirror_repair(v)
+                U_new[i] = v
+
+            # --- 奇迹（exploration）：跨派杂交/大步跳变 ---
+            for i in idx_c:
+                if self.rng.rand() < MIRACLE_PROB:
+                    # 50% 大步随机跳，50% 跨派杂交
+                    if self.rng.rand() < 0.5:
+                        v = self.rng.rand(self.dim)
+                    else:
+                        # 选另一派一个优秀个体进行一半维度交叉
+                        other_c = self.rng.choice([cc for cc in range(self.C) if cc != c])
+                        idx_oc = np.where(self.comm_idx == other_c)[0]
+                        best_oc = idx_oc[np.argmax(scores[idx_oc])]
+                        mate = self.U[best_oc]
+                        mask = self.rng.rand(self.dim) < 0.5
+                        v = np.where(mask, self.U[i], mate)
+                        # 加一点噪声
+                        v += self.rng.normal(0.0, steps_new[i] * 0.2, size=self.dim)
+                    v = self._mirror_repair(v)
+                    U_new[i] = v
+
+            # --- 替换（substitution）：本派最差替换 ---
+            n_sub = max(1, int(np.floor(self.S * SUBSTITUTION_FR)))
+            worst_local = idx_c[np.argsort(scores[idx_c])[:n_sub]]
+            U_new[worst_local] = self.rng.rand(n_sub, self.dim)
+            steps_new[worst_local] = self.rng.uniform(STEP_MIN, STEP_MAX, size=(n_sub, self.dim))
+
+            # --- 流放（exile）：长期停滞/劣化个体强制重置 ---
+            exile_ids = idx_c[self.stall[idx_c] >= MAX_STALL_GENS]
+            if exile_ids.size > 0:
+                U_new[exile_ids] = self.rng.rand(exile_ids.size, self.dim)
+                steps_new[exile_ids] = self.rng.uniform(STEP_MIN, STEP_MAX, size=(exile_ids.size, self.dim))
+                self.stall[exile_ids] = 0  # 重置滞留计数
+
+        # 全局保持至少一个精英不被破坏（强精英策略）
+        best_global = int(np.argmax(scores))
+        U_new[best_global] = self.U[best_global]
+        steps_new[best_global] = self.steps[best_global]
+
+        # 写回
+        self.U = self._clip01(U_new)
+        self.steps = np.clip(steps_new, STEP_MIN, STEP_MAX)
+        self.prev_scores = scores.copy()
+
+# ==================== 主流程：DRA 搜索 → 最终训练 → 测试 + 回测导出 ====================
+def main():
+    X_train, y_train, X_val, y_val, X_test, y_test = load_data(data_root)
+    Ntr, L, D = X_train.shape
+    print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+
+    dim = vector_dim()
+    dra = TrueDRAOptimizer(
+        communities=DRA_COMMUNITIES, comm_size=DRA_COMM_SIZE,
+        dim=dim, max_gen=DRA_GEN, seed=seed
+    )
+
+    elites, search_rows = [], []
+    best_overall = -1.0; no_improve_gen = 0
+
+    # >>> 新增：适应度收敛日志
+    fitness_log = []
+
+    for gen in range(DRA_GEN):
+        U = dra.ask()  # [N, dim]
+        scores = np.zeros(U.shape[0], dtype=float)
+        gen_records, improved = [], False
+
+        for i in range(U.shape[0]):
+            params = decode_vector(U[i], seq_len=L)
+            macro_f1, va_metrics = train_eval_once(
+                params, X_train, y_train, X_val, y_val,
+                fast_epochs=FAST_EPOCHS,
+                batch=params["batch_size"],
+                weight_decay=params["weight_decay"],
+                lr=params["lr"]
+            )
+            scores[i] = macro_f1
+            rec = {"gen": gen, "idx": i, "score": macro_f1, **params}
+            gen_records.append(rec); search_rows.append(rec)
+            print(f"[GEN {gen:02d} | IND {i:02d}] macroF1={macro_f1:.4f} params={params}")
+            if macro_f1 > best_overall + 1e-6: best_overall = macro_f1; improved = True
+
+        # ---- 新增：记录当代的适应度统计（用于画收敛曲线）----
+        best_score   = float(np.max(scores))
+        mean_score   = float(np.mean(scores))
+        median_score = float(np.median(scores))
+        top_k = int(min(4, scores.size))
+        topk_mean = float(np.mean(np.sort(scores)[-top_k:]))
+
+        rec_fit = {"gen": gen, "best": best_score, "mean": mean_score,
+                   "median": median_score, "topk_mean": topk_mean}
+        for c in range(DRA_COMMUNITIES):
+            idx_c = np.where(dra.comm_idx == c)[0]
+            rec_fit[f"comm{c}_best"] = float(np.max(scores[idx_c])) if idx_c.size > 0 else float('nan')
+        fitness_log.append(rec_fit)
+
+        # 精英簿：保留前 K（这里按 4 个）
+        gen_sorted = sorted(gen_records, key=lambda r: r["score"], reverse=True)
+        top_k_keep = min(4, len(gen_sorted))
+        for r in gen_sorted[:top_k_keep]:
+            elites.append({"u": U[r["idx"]].copy(), "score": r["score"], "params": {k:r[k] for k in r if k not in ("gen","idx","score")}})
+        elites = sorted(elites, key=lambda e: e["score"], reverse=True)[:top_k_keep]
+
+        # 代际早停（注意：记录 fitness_log 已在上方完成）
+        if improved:
+            no_improve_gen = 0
+        else:
+            no_improve_gen += 1
+            if no_improve_gen >= NO_IMPROVE_PATI:
+                print(f"[TrueDRA] Early stop search at generation {gen} (no improvement for {NO_IMPROVE_PATI} gens).")
+                dra.tell_and_step(scores, gen)  # 完成内部状态
+                break
+
+        # DRA 进入下一代
+        dra.tell_and_step(scores, gen)
+
+    # 记录搜索日志与最佳参数
+    pd.DataFrame(search_rows).to_csv(os.path.join(out_dir, "search_log.csv"), index=False, encoding="utf-8-sig")
+    best = max(search_rows, key=lambda r: r["score"])
+    best_params = {k:best[k] for k in best.keys() if k not in ("gen","idx","score")}
+    with open(os.path.join(out_dir, "best_search.json"), "w", encoding="utf-8") as f:
+        json.dump({"best_macro_f1": float(best["score"]), "best_params": best_params}, f, ensure_ascii=False, indent=2)
+    print("Best (by macroF1):", best_params, "score=", best["score"])
+
+    # ---------- 新增：适应度曲线落盘与绘图 ----------
+    df_fit = pd.DataFrame(fitness_log)
+    df_fit.to_csv(os.path.join(out_dir, "fitness_curve.csv"), index=False, encoding="utf-8-sig")
+
+    plt.figure(figsize=(12,6))
+    plt.plot(df_fit["gen"], df_fit["best"],   label="Best (global)")
+    plt.plot(df_fit["gen"], df_fit["mean"],   label="Mean (global)")
+    plt.plot(df_fit["gen"], df_fit["median"], label="Median (global)")
+    if "topk_mean" in df_fit.columns:
+        plt.plot(df_fit["gen"], df_fit["topk_mean"], label="Top-4 Mean")
+    # 各宗派最佳（虚线）
+    for c in range(DRA_COMMUNITIES):
+        col = f"comm{c}_best"
+        if col in df_fit.columns:
+            plt.plot(df_fit["gen"], df_fit[col], linestyle="--", label=f"Best (comm {c})")
+    plt.xlabel("Generation")
+    plt.ylabel("fitness")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "fitness_curve.png"), dpi=300)
+    plt.close()
+
+    # ---------- 最终训练（val 早停） ----------
+    dl_tr = make_loader(X_train, y_train, batch=best_params["batch_size"], shuffle=True)
+    dl_va = make_loader(X_val,   y_val,   batch=best_params["batch_size"], shuffle=False)
+    dl_te = make_loader(X_test,  y_test,  batch=best_params["batch_size"], shuffle=False)
+
+    model = ConvNeXtV2_PatchLinformer_Classifier(
+        seq_len=L, d_in=D, num_classes=num_classes,
+        cnx_dim=best_params["cnx_dim"], cnx_depth=best_params["cnx_depth"], cnx_kernel=best_params["cnx_kernel"],
+        cnx_drop_path=best_params["cnx_drop_path"], cnx_layerscale=1e-6,
+        patch_len=best_params["patch_len"], stride=best_params["stride"], d_model=best_params["d_model"],
+        lin_heads=best_params["lin_heads"], lin_layers=best_params["lin_layers"], lin_k=best_params["lin_k"], dim_ff=best_params["dim_ff"],
+        dropout=best_params["dropout"], use_cls_token=True, channel_agg="attn"
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=best_params["lr"], weight_decay=best_params["weight_decay"])
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type=="cuda"))
+    amp_enabled = (device.type == "cuda")
+
+    total_steps = len(dl_tr)*BASE_EPOCHS
+    warmup_steps = max(1, int(WARMUP_RATIO*total_steps))
+    def lr_schedule(step):
+        if step <= warmup_steps:
+            return best_params["lr"] * step / max(1,warmup_steps)
+        t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return BASE_MIN_LR + 0.5*(best_params["lr"] - BASE_MIN_LR)*(1+math.cos(math.pi*t))
+
+    history = []
+    best_val_f1, best_state, es_counter, step = -1.0, None, 0, 0
+
+    for ep in range(1, BASE_EPOCHS+1):
+        t0 = time.time(); model.train()
+        run_loss, nobs = 0.0, 0
+        for Xb, yb in dl_tr:
+            if PIN_MEMORY:
+                Xb = Xb.cuda(non_blocking=True) if device.type=="cuda" else Xb.to(device)
+                yb = yb.cuda(non_blocking=True) if device.type=="cuda" else yb.to(device)
+            else:
+                Xb = Xb.to(device); yb = yb.to(device)
+            Xb = add_train_time_aug(Xb)
+
+            step += 1
+            cur_lr = lr_schedule(step)
+            for pg in opt.param_groups: pg["lr"] = cur_lr
+
+            opt.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                logits = model(Xb); loss = criterion(logits, yb)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt); scaler.update()
+
+            bs = Xb.size(0); run_loss += loss.item()*bs; nobs += bs
+
+        tr_metrics, _, _, _ = evaluate(model, dl_tr, device)
+        va_metrics, _, _, _ = evaluate(model, dl_va, device)
+
+        log = {
+            "epoch": ep,
+            "train_loss": run_loss/max(1,nobs), "train_acc": tr_metrics["accuracy"], "train_macro_f1": tr_metrics["macro_f1"],
+            "val_loss": va_metrics["loss"],     "val_acc": va_metrics["accuracy"],   "val_macro_f1": va_metrics["macro_f1"],
+            "lr": float(cur_lr), "time_sec": round(time.time()-t0, 2)
+        }
+        history.append(log); print(log)
+
+        if va_metrics["macro_f1"] > best_val_f1 + 1e-6:
+            best_val_f1 = va_metrics["macro_f1"]; best_state = copy.deepcopy(model.state_dict()); es_counter = 0
+        else:
+            es_counter += 1
+        if es_counter >= PATIENCE_ES:
+            print(f"Early stopping at epoch {ep}. Best val_macro_f1={best_val_f1:.6f}")
+            break
+
+    pd.DataFrame(history).to_csv(os.path.join(out_dir, "training_log.csv"), index=False, encoding="utf-8-sig")
+    plot_curves(history,
+                save_loss_path=os.path.join(out_dir, "curves_loss.png"),
+                save_acc_path=os.path.join(out_dir, "curves_accuracy.png"),
+                save_f1_path=os.path.join(out_dir, "curves_macro_f1.png"))
+
+    if best_state is not None: model.load_state_dict(best_state)
+    torch.save(model.state_dict(), os.path.join(out_dir, "best_model.pth"))
+
+    # ---------- 测试 ----------
+    test_metrics, y_pred, logits, y_true = evaluate(model, dl_te, device)
+    print("==== Test Metrics ===="); print(test_metrics)
+    pd.DataFrame([test_metrics]).to_csv(os.path.join(out_dir, "metrics_test.csv"), index=False, encoding="utf-8-sig")
+
+    rpt = classification_report(y_true, y_pred, labels=[0,1], digits=4, zero_division=0, output_dict=True)
+    with open(os.path.join(out_dir, "classification_report.json"), "w", encoding="utf-8") as f:
+        json.dump(rpt, f, ensure_ascii=False, indent=2)
+    pd.DataFrame({"y_true": y_true.astype(int), "y_pred": y_pred.astype(int)}).to_csv(
+        os.path.join(out_dir, "pred_vs_true_test.csv"), index=False, encoding="utf-8-sig"
+    )
+
+    plot_confusion_percent(y_true, y_pred, os.path.join(out_dir, "confusion_matrix_percent.png"))
+    plot_prob_histograms(y_true, logits, save_dir=os.path.join(out_dir, "prob_histograms"))
+    plot_misclassified_examples(
+        X_test, y_true, y_pred,
+        save_dir=os.path.join(out_dir, "misclassified_plots"),
+        max_plots=max_mis_plots, features_to_show=features_to_show
+    )
+
+    precs = np.array([test_metrics["precision_class0"], test_metrics["precision_class1"]], dtype=float)
+    recs  = np.array([test_metrics["recall_class0"],    test_metrics["recall_class1"]], dtype=float)
+    f1s   = np.array([test_metrics["f1_class0"],        test_metrics["f1_class1"]], dtype=float)
+    acc   = float(test_metrics["accuracy"])
+    macro_f1 = float(test_metrics["macro_f1"])
+    loss  = float(test_metrics["loss"])
+    save_metrics_table_binary(
+        precs, recs, f1s, acc, macro_f1, loss,
+        save_csv=os.path.join(out_dir, "metrics_table.csv"),
+        save_png=os.path.join(out_dir, "metrics_table.png"),
+        floatfmt=table_floatfmt
+    )
+
+    # ==================== === 回测所需数据导出 === ====================
+    # 1) 概率矩阵（列顺序：probs_down, probs_up）
+    probs = softmax_np(logits)
+    if probs.shape[1] != 2:
+        raise RuntimeError(f"期望二分类概率 shape [N,2]，实际 {probs.shape}")
+    np.save(os.path.join(out_dir, "test_probs.npy"), probs)
+
+    # 2) 从 meta + split 大小恢复“测试样本末端在原始时间轴上的索引”
+    meta_path = os.path.join(data_root, "meta_summary.csv")
+    default_seq_len = X_train.shape[1]
+    seq_len_meta, stride_meta = _parse_meta(meta_path, default_seq_len, default_stride=1)
+
+    n_tr_rows = _rows_from_windows(X_train.shape[0], seq_len_meta, stride_meta)
+    n_va_rows = _rows_from_windows(X_val.shape[0],   seq_len_meta, stride_meta)
+    te0 = n_tr_rows + n_va_rows
+    end_indices = np.arange(te0 + (seq_len_meta - 1),
+                            te0 + (seq_len_meta - 1) + stride_meta * X_test.shape[0],
+                            stride_meta, dtype=int)
+
+    # 3) 读取对齐表（包含日期与价格列）
+    aligned_csv = os.path.join(data_root, "features_labels_aligned.csv")
+    if not os.path.exists(aligned_csv):
+        raise FileNotFoundError(f"找不到对齐表：{aligned_csv}。请确认预处理阶段已写出该文件。")
+    df_aln = pd.read_csv(aligned_csv)
+
+    date_col = _detect_col(df_aln.columns, DATE_CANDIDATES)
+    open_col = _detect_col(df_aln.columns, OPEN_CANDIDATES)
+    close_col = _detect_col(df_aln.columns, CLOSE_CANDIDATES)
+    high_col = _detect_col(df_aln.columns, HIGH_CANDIDATES)
+    low_col = _detect_col(df_aln.columns, LOW_CANDIDATES)
+
+    if date_col is None:
+        raise RuntimeError("无法在 features_labels_aligned.csv 中识别日期列，请检查列名。")
+    if open_col is None or close_col is None:
+        print("[Warn] 未识别到 open/close 列，将以 NaN 填充价格。")
+    if high_col is None or low_col is None:
+        print("[Warn] 未识别到 high/low 列，将以 NaN 填充价格。")
+
+    # 4) 组装导出（t 与 t+1）
+    df_bt = pd.DataFrame({
+        "idx_t": end_indices,
+        "date_t": pd.to_datetime(df_aln.loc[end_indices, date_col].values, errors="coerce")
+    })
+    df_bt["open_t"]  = df_aln.loc[end_indices, open_col].values  if open_col  in df_aln.columns else np.nan
+    df_bt["close_t"] = df_aln.loc[end_indices, close_col].values if close_col in df_aln.columns else np.nan
+    df_bt["high_t"]  = df_aln.loc[end_indices, high_col].values  if high_col  in df_aln.columns else np.nan
+    df_bt["low_t"]   = df_aln.loc[end_indices, low_col].values   if low_col   in df_aln.columns else np.nan
+
+    end_indices_next = np.clip(end_indices + 1, 0, len(df_aln) - 1)
+    df_bt["date_t1"]  = pd.to_datetime(df_aln.loc[end_indices_next, date_col].values, errors="coerce")
+    df_bt["open_t1"]  = df_aln.loc[end_indices_next, open_col].values  if open_col  in df_aln.columns else np.nan
+    df_bt["close_t1"] = df_aln.loc[end_indices_next, close_col].values if close_col in df_aln.columns else np.nan
+    df_bt["high_t1"]  = df_aln.loc[end_indices_next, high_col].values  if high_col  in df_aln.columns else np.nan
+    df_bt["low_t1"]   = df_aln.loc[end_indices_next, low_col].values   if low_col   in df_aln.columns else np.nan
+
+    # 5) 概率/预测/真值
+    df_bt["probs_down"] = probs[:, 0]
+    df_bt["probs_up"]   = probs[:, 1]
+    df_bt["y_pred"]     = y_pred.astype(int)
+    df_bt["y_true"]     = y_true.astype(int)
+
+    # 6) 标准化日期列（回测统一使用）
+    df_bt["date"] = pd.to_datetime(df_bt["date_t"], errors="coerce")
+    df_bt["date_str"] = df_bt["date"].dt.strftime("%Y-%m-%d")
+
+    # 7) 落盘
+    backtest_csv = os.path.join(out_dir, "preds_test_with_prices.csv")
+    df_bt.to_csv(backtest_csv, index=False, encoding="utf-8-sig")
+
+    if len(df_bt) != len(y_test):
+        print(f"[Warn] 对齐行数与测试样本数不一致：df_bt={len(df_bt)} vs y_test={len(y_test)}。"
+              f"请检查 meta_summary.csv 的 seq_len/stride 是否与预处理一致。")
+
+    print("All done. Results in:", out_dir)
+    print("Backtest export:", backtest_csv)
+    # ==================== === 回测所需数据导出 === ====================
+
+if __name__ == "__main__":
+    main()
