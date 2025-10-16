@@ -1,0 +1,205 @@
+
+import os
+import json
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from joblib import dump
+
+# ========================= 可调参数 =========================
+INPUT_CSV = "600276_with_features.csv"     # 需包含 1_day_Return_next 列
+OUT_DIR   = "processed"
+
+# 滑窗长度与步长（PatchTCN/Transformer 常用形状 [N, T, C]）
+SEQ_LEN   = 15
+STRIDE    = 1
+
+# 时序划分比例（不打乱，按时间先后）
+R_TRAIN, R_VAL, R_TEST = 0.70, 0.15, 0.15
+
+# 过滤时最少样本行（过少则报错）
+MIN_ROWS_AFTER_CLEAN = 200
+
+EXCLUDE_COLS = {"future_10d_return","10_day_Return","1_day_Return""label_binary"}
+
+# 自动探测日期列（仅用于排序与对齐）
+DATE_CANDIDATES = ["Date", "date", "交易日期", "时间", "Datetime", "datetime", "日期"]
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ========================= 工具函数 =========================
+def detect_date_col(cols):
+    lowers = {c.lower(): c for c in cols}
+    for k in DATE_CANDIDATES:
+        if k.lower() in lowers:
+            return lowers[k.lower()]
+    # contains 匹配
+    for c in cols:
+        lc = c.lower()
+        for k in DATE_CANDIDATES:
+            if k.lower() in lc:
+                return c
+    return None
+
+def make_binary_label_from_next_return(df: pd.DataFrame, next_col="future_10d_return") -> pd.Series:
+    if next_col not in df.columns:
+        raise KeyError(f"未找到列 {next_col}，请先在特征阶段生成该列。")
+    return (df[next_col] > 0).astype(int)  # >0 为 1(UP)，<=0 为 0(DOWN)
+
+def time_splits(n, r_train=0.7, r_val=0.15, r_test=0.15):
+    assert abs(r_train + r_val + r_test - 1.0) < 1e-8
+    n_train = int(n * r_train)
+    n_val   = int(n * r_val)
+    n_test  = n - n_train - n_val
+    return (0, n_train), (n_train, n_train + n_val), (n_train + n_val, n)
+
+def sliding_window(X2d: np.ndarray, y1d: np.ndarray, T: int, stride: int):
+    """
+    X2d: [N, C], y1d: [N,]
+    输出：X: [M, T, C], y: [M,] （与窗口最后一个时间点对齐）
+    """
+    N, C = X2d.shape
+    xs, ys = [], []
+    for start in range(0, N - T + 1, stride):
+        end = start + T
+        x = X2d[start:end]
+        y = y1d[end - 1]
+        if np.isnan(x).any() or np.isnan(y):
+            continue
+        xs.append(x)
+        ys.append(y)
+    if len(xs) == 0:
+        return np.empty((0, T, C), dtype=float), np.empty((0,), dtype=int)
+    return np.stack(xs, 0), np.array(ys, dtype=int)
+
+def standardize_by_train(Xtr, Xva, Xte):
+    """
+    用训练集拟合 StandardScaler（按通道），并应用到 val/test。
+    """
+    Ntr, T, C = Xtr.shape
+    scaler = StandardScaler()
+    Xtr2 = Xtr.reshape(Ntr * T, C)
+    scaler.fit(Xtr2)
+
+    def trf(X):
+        N, T, C = X.shape
+        X2 = X.reshape(N * T, C)
+        X2 = scaler.transform(X2)
+        return X2.reshape(N, T, C)
+
+    return trf(Xtr), trf(Xva), trf(Xte), scaler
+
+# ========================= 主流程 =========================
+def main():
+    # 1) 读取
+    if not os.path.exists(INPUT_CSV):
+        raise FileNotFoundError(f"找不到输入文件：{INPUT_CSV}")
+    df = pd.read_csv(INPUT_CSV)
+    original_cols = list(df.columns)
+
+    # 2) 日期列与排序
+    date_col = detect_date_col(df.columns)
+    if date_col is not None:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.sort_values(by=date_col).reset_index(drop=True)
+
+    # 3) 生成二分类标签
+    df["label_binary"] = make_binary_label_from_next_return(df, "future_10d_return")
+    df["label_binary-1"] = df["label_binary"].shift(-1) / df["close"] - 1
+    # 4) 清洗（最保守做法：全表 dropna；如需保留更多样本，可仅对必要列 dropna）
+    df_clean = df.dropna().reset_index(drop=True)
+    if len(df_clean) < MIN_ROWS_AFTER_CLEAN:
+        raise RuntimeError(f"清洗后样本过少：{len(df_clean)} 行，请检查缺失或放宽清洗策略。")
+
+    # 5) 选特征：所有数值列，排除目标与泄露列
+    numeric_cols = [c for c in df_clean.columns if pd.api.types.is_numeric_dtype(df_clean[c])]
+    feature_cols = [c for c in numeric_cols if c not in EXCLUDE_COLS]
+    target_col = "label_binary"
+    if len(feature_cols) == 0:
+        raise RuntimeError("无可用数值特征列，请检查。")
+
+    # 6) 对齐表保存（便于对照核查）
+    aligned_cols = []
+    if date_col is not None:
+        aligned_cols.append(date_col)
+    aligned_cols += feature_cols + [target_col]
+    df_aligned = df_clean[aligned_cols].copy()
+    df_aligned.to_csv(os.path.join(OUT_DIR, "features_labels_aligned.csv"),
+                      index=False, encoding="utf-8-sig")
+
+    # 7) 时序切分（先行切分，再滑窗，避免信息泄露）
+    N = len(df_clean)
+    (tr0, tr1), (va0, va1), (te0, te1) = time_splits(N, R_TRAIN, R_VAL, R_TEST)
+    df_tr = df_clean.iloc[tr0:tr1].reset_index(drop=True)
+    df_va = df_clean.iloc[va0:va1].reset_index(drop=True)
+    df_te = df_clean.iloc[te0:te1].reset_index(drop=True)
+
+    Xtr2 = df_tr[feature_cols].to_numpy(dtype=float)
+    ytr1 = df_tr[target_col].to_numpy(dtype=int)
+    Xva2 = df_va[feature_cols].to_numpy(dtype=float)
+    yva1 = df_va[target_col].to_numpy(dtype=int)
+    Xte2 = df_te[feature_cols].to_numpy(dtype=float)
+    yte1 = df_te[target_col].to_numpy(dtype=int)
+
+    # 8) 滑窗
+    X_train, y_train = sliding_window(Xtr2, ytr1, SEQ_LEN, STRIDE)
+    X_val,   y_val   = sliding_window(Xva2, yva1, SEQ_LEN, STRIDE)
+    X_test,  y_test  = sliding_window(Xte2, yte1, SEQ_LEN, STRIDE)
+    if X_train.size == 0 or X_val.size == 0 or X_test.size == 0:
+        raise RuntimeError("滑窗后某个集合为空，请调整 SEQ_LEN/STRIDE 或检查数据长度。")
+
+    # 9) 标准化（仅以训练集拟合）
+    X_train, X_val, X_test, scaler = standardize_by_train(X_train, X_val, X_test)
+    dump(scaler, os.path.join(OUT_DIR, "scaler.pkl"))
+
+    # 10) 保存 NPY
+    np.save(os.path.join(OUT_DIR, "X_train.npy"), X_train)
+    np.save(os.path.join(OUT_DIR, "y_train.npy"), y_train)
+    np.save(os.path.join(OUT_DIR, "X_val.npy"),   X_val)
+    np.save(os.path.join(OUT_DIR, "y_val.npy"),   y_val)
+    np.save(os.path.join(OUT_DIR, "X_test.npy"),  X_test)
+    np.save(os.path.join(OUT_DIR, "y_test.npy"),  y_test)
+
+    # 11) 统计与元信息（CSV 版本，风格与示例保持一致）
+    cls_dist = pd.DataFrame({
+        "set": ["train", "val", "test"],
+        "class_0_DOWN": [(y_train==0).sum(), (y_val==0).sum(), (y_test==0).sum()],
+        "class_1_UP":   [(y_train==1).sum(), (y_val==1).sum(), (y_test==1).sum()],
+        "total":        [y_train.size, y_val.size, y_test.size],
+    })
+    cls_dist.to_csv(os.path.join(OUT_DIR, "class_distribution.csv"),
+                    index=False, encoding="utf-8-sig")
+
+    meta = {
+        "input_csv": INPUT_CSV,
+        "out_dir": OUT_DIR,
+        "date_col": date_col,
+        "ratios": {"train": R_TRAIN, "val": R_VAL, "test": R_TEST},
+        "seq_len": SEQ_LEN,
+        "stride": STRIDE,
+        "num_features": int(X_train.shape[-1]),
+        "rows_after_clean": int(N),
+        "shapes": {
+            "X_train": list(X_train.shape),
+            "X_val":   list(X_val.shape),
+            "X_test":  list(X_test.shape),
+            "y_train": list(y_train.shape),
+            "y_val":   list(y_val.shape),
+            "y_test":  list(y_test.shape),
+        }
+    }
+    pd.DataFrame([meta]).to_csv(
+        os.path.join(OUT_DIR, "meta_summary.csv"),
+        index=False, encoding="utf-8-sig"
+    )
+
+    # 控制台输出
+    print("==== 预处理完成 ====")
+    print(f"输出目录: {OUT_DIR}")
+    print(f"X_train: {X_train.shape}, X_val: {X_val.shape}, X_test: {X_test.shape}")
+    print(f"y_train: {y_train.shape}, y_val: {y_val.shape}, y_test: {y_test.shape}")
+    print("类别分布（class_distribution.csv）：")
+    print(cls_dist)
+
+if __name__ == "__main__":
+    main()
