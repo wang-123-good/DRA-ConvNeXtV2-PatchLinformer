@@ -120,8 +120,8 @@ def cal_feature(df: pd.DataFrame) -> pd.DataFrame:
 
 # --------- Load input, compute features, save ----------
 if __name__ == "__main__":
-    in_path = "HR.xlsx"  # 示例：Excel 文件
-    out_path = "HR_with_features.csv"
+    in_path = "600276.xlsx"  # 示例：Excel 文件
+    out_path = "600276_with_features.csv"
 
     if not os.path.exists(in_path):
         raise FileNotFoundError(f"找不到输入文件：{in_path}")
