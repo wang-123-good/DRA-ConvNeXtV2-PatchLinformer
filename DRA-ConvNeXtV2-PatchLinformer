@@ -5,7 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report, f1_score
 import matplotlib.pyplot as plt
 
-# ==================== 全局可调参数 ====================
+
 data_root   = "processed"
 out_dir     = "./dra_convnextv2_patchlinformer"
 os.makedirs(out_dir, exist_ok=True)
@@ -18,36 +18,36 @@ BASE_WEIGHT_DECAY = 5e-4
 BASE_MIN_LR       = 1e-6
 WARMUP_RATIO      = 0.05
 
-# 训练增强
+
 gauss_noise_std = 0.01
 time_mask_prob  = 0.15
 time_mask_max   = 2
 
-# ===== 二分类设置 =====
+
 num_classes      = 2
 table_floatfmt   = ".4f"
 max_mis_plots    = 6
 features_to_show = 3
 
-# ==================== DRA 搜索配置（真·DRA） ====================
-# 总个体数 = DRA_COMMUNITIES * DRA_COMM_SIZE（若与 DRA_POP 不一致，以前者为准）
-DRA_COMMUNITIES  = 2         # 宗派/学校数量（>=2 更有跨派交流效果）
-DRA_COMM_SIZE    = 6         # 每派人数（含领袖/传教士/信徒）
+
+
+DRA_COMMUNITIES  = 2        
+DRA_COMM_SIZE    = 6         
 DRA_POP          = DRA_COMMUNITIES * DRA_COMM_SIZE
-DRA_GEN          = 6         # 最大迭代代数（建议先小试，找到趋势再拉长）
+DRA_GEN          = 6         
 
 # 机制开关/超参
-DRA_TOP_MISSION  = 2         # 每派“传教士”人数（除去领袖）
-PROMOTION_RATE   = 0.60      # 推广：朝领袖/传教士靠拢的强度上限（随退火缩放）
-MIRACLE_PROB     = 0.08      # 奇迹：大步长跃迁/跨派重组的概率
-SUBSTITUTION_FR  = 0.20      # 替换：每代按该比例替换本派最差个体（0~1）
-REWARD_ALPHA     = 0.20      # 奖励：提升则步长 *= (1 + ALPHA * 退火因子)
-PENALTY_BETA     = 0.15      # 惩罚：退步则步长 *= (1 - BETA  * 退火因子)
-STEP_MIN, STEP_MAX = 0.03, 0.50 # 个体步长（含向量噪声）的上下限
-MAX_STALL_GENS   = 2         # 流放：连续劣化/停滞的代数阈值（≥该阈值强制替换）
+DRA_TOP_MISSION  = 2         
+PROMOTION_RATE   = 0.60      
+MIRACLE_PROB     = 0.08      
+SUBSTITUTION_FR  = 0.20     
+REWARD_ALPHA     = 0.20      
+PENALTY_BETA     = 0.15      
+STEP_MIN, STEP_MAX = 0.03, 0.50 
+MAX_STALL_GENS   = 2        
 
-FAST_EPOCHS      = 4         # 单次评估快速训练 epoch
-NO_IMPROVE_PATI  = 2         # 代际早停：全局最优 no-improve 连续阈值
+FAST_EPOCHS      = 4         
+NO_IMPROVE_PATI  = 2         
 
 # DataLoader 加速参数
 NUM_WORKERS       = max(2, os.cpu_count() // 2)
@@ -55,12 +55,12 @@ PIN_MEMORY        = True
 PERSISTENT_WORKER = True
 PREFETCH_FACTOR   = 4
 
-# === 回测导出：列名候选（用于自动识别日期/价格列） ===
-DATE_CANDIDATES  = ["Date","date","交易日期","时间","Datetime","datetime","日期"]
-OPEN_CANDIDATES  = ["Open","open","开盘","开盘价","OPEN"]
-CLOSE_CANDIDATES = ["Close","close","收盘","收盘价","CLOSE"]
-HIGH_CANDIDATES  = ["High","high","最高","最高价","HIGH"]
-LOW_CANDIDATES   = ["Low","low","最低","最低价","LOW"]
+
+DATE_CANDIDATES  = ["Date"]
+OPEN_CANDIDATES  = ["Open"
+CLOSE_CANDIDATES = ["Close"]
+HIGH_CANDIDATES  = ["High"]
+LOW_CANDIDATES   = ["Low"]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if device.type == "cuda":
@@ -73,7 +73,7 @@ def set_seed(s=42):
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(s)
 set_seed(seed)
 
-# ==================== 数据集与加载 ====================
+
 class SeqClsDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray):
         self.X = X.astype(np.float32)  # [N, L, D]
@@ -97,7 +97,7 @@ def load_data(root):
     y_test  = np.load(os.path.join(root, "y_test.npy"))
     return (X_train, y_train, X_val, y_val, X_test, y_test)
 
-# ==================== 小工具（回测导出用） ====================
+
 def _detect_col(cols, candidates):
     lowers = {c.lower(): c for c in cols}
     for k in candidates:
@@ -125,7 +125,7 @@ def _parse_meta(meta_csv_path, default_seq_len, default_stride=1):
 def _rows_from_windows(n_win, T, st):
     return (int(n_win) - 1) * int(st) + int(T)
 
-# ==================== 工具模块：DropPath / LN(通道后) ====================
+
 class DropPath(nn.Module):
     def __init__(self, drop_prob: float = 0.0):
         super().__init__(); self.drop_prob = float(drop_prob)
@@ -143,7 +143,7 @@ class LayerNormChannelsLast1D(nn.Module):
     def forward(self, x):  # [B,C,L]
         return self.ln(x.transpose(1,2)).transpose(1,2)
 
-# ==================== ConvNeXt V2 Block / Front (1D) ====================
+
 class ConvNeXtV2Block1D(nn.Module):
     def __init__(self, dim, kernel_size=7, drop_path=0.0, layerscale_init=1e-6):
         super().__init__()
@@ -175,7 +175,6 @@ class ConvNeXtV2Front1D(nn.Module):
         x = self.stem(x); x = self.blocks(x); x = self.head(x)
         return (x + res).squeeze(1)
 
-# ==================== Patch 嵌入 ====================
 class PatchEmbedding1D(nn.Module):
     def __init__(self, seq_len, patch_len, stride, d_model, dropout=0.0, use_cls_token=True):
         super().__init__()
@@ -202,11 +201,9 @@ class PatchEmbedding1D(nn.Module):
         x = x + self.pos
         return self.drop(x)
 
-# ==================== Linformer 编码器 ====================
+
 class LinformerSelfAttention(nn.Module):
-    """
-    Q,K,V: [B,T,D]；使用可学习 E_K/E_V: [T,k] 将时间维 T 投影到 k，再做多头注意力。
-    """
+
     def __init__(self, d_model, n_heads, proj_len_k, token_count, attn_drop=0.0):
         super().__init__()
         assert d_model % n_heads == 0
@@ -223,17 +220,17 @@ class LinformerSelfAttention(nn.Module):
     def forward(self, x):  # x:[B,T,D]
         B, T, D = x.shape
         qkv = self.proj_qkv(x)
-        q, k, v = qkv.chunk(3, dim=-1)                            # [B,T,D]x3
+        q, k, v = qkv.chunk(3, dim=-1)                            
         q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        k_lin = torch.einsum("bhtd,tk->bhkd", k, self.E_k)          # [B,H,k,d_h]
-        v_lin = torch.einsum("bhtd,tk->bhkd", v, self.E_v)          # [B,H,k,d_h]
-        attn_scores = torch.matmul(q, k_lin.transpose(-2, -1)) * self.scale  # [B,H,T,k]
+        k_lin = torch.einsum("bhtd,tk->bhkd", k, self.E_k)          
+        v_lin = torch.einsum("bhtd,tk->bhkd", v, self.E_v)         
+        attn_scores = torch.matmul(q, k_lin.transpose(-2, -1)) * self.scale 
         attn = F.softmax(attn_scores, dim=-1)
         attn = self.attn_drop(attn)
-        ctx = torch.matmul(attn, v_lin)                             # [B,H,T,d_h]
-        ctx = ctx.transpose(1, 2).contiguous().view(B, T, D)        # [B,T,D]
+        ctx = torch.matmul(attn, v_lin)                             
+        ctx = ctx.transpose(1, 2).contiguous().view(B, T, D)       
         return self.o_proj(ctx)
 
 class LinformerEncoderLayer(nn.Module):
@@ -268,9 +265,9 @@ class LinformerEncoder(nn.Module):
             x = blk(x)
         return self.norm(x)
 
-# ==================== 通道聚合 ====================
+
 class ChannelAggregator(nn.Module):
-    def __init__(self, d_model, mode="attn", dropout=0.0):  # 默认改为 "attn"
+    def __init__(self, d_model, mode="attn", dropout=0.0):  
         super().__init__(); self.mode = mode
         if mode == "attn":
             self.q = nn.Linear(d_model, d_model); self.k = nn.Linear(d_model, d_model)
@@ -282,7 +279,7 @@ class ChannelAggregator(nn.Module):
         attn = F.softmax(attn, dim=-1); attn = self.drop(attn)
         return torch.matmul(attn, V).mean(dim=1)
 
-# ==================== 整体模型 ====================
+
 class ConvNeXtV2_PatchLinformer_Classifier(nn.Module):
     def __init__(self, seq_len, d_in, num_classes,
                  cnx_dim=128, cnx_depth=4, cnx_kernel=7, cnx_drop_path=0.1, cnx_layerscale=1e-6,
@@ -304,15 +301,15 @@ class ConvNeXtV2_PatchLinformer_Classifier(nn.Module):
 
     def forward(self, x):  # [B,L,D]
         B,L,D = x.shape; assert L == self.seq_len and D == self.d_in
-        x_cd = x.permute(0,2,1).contiguous().view(B*D, L)      # [B*D, L]
-        x_cd = self.front(x_cd)                                 # [B*D, L]
-        z    = self.embed(x_cd)                                 # [B*D, Tk(+1), d_model]
-        z    = self.encoder(z)                                  # [B*D, Tk(+1), d_model]
+        x_cd = x.permute(0,2,1).contiguous().view(B*D, L)     
+        x_cd = self.front(x_cd)                                
+        z    = self.embed(x_cd)                                 
+        z    = self.encoder(z)                                 
         z    = z[:,0,:] if self.use_cls_token else z.mean(dim=1)
-        H    = z.view(B, D, -1)                                 # [B, D, d_model]
-        return self.head(self.agg(H))                           # [B, 2]
+        H    = z.view(B, D, -1)                                 
+        return self.head(self.agg(H))                          
 
-# ==================== 评估/可视化（按二分类 + macro-F1） ====================
+
 def add_train_time_aug(x_tensor):
     if gauss_noise_std > 0: x_tensor = x_tensor + gauss_noise_std * torch.randn_like(x_tensor)
     if time_mask_prob > 0:
@@ -447,7 +444,7 @@ def save_metrics_table_binary(precs, recs, f1s, acc, macro_f1, loss, save_csv, s
         vals = [row] + [f"{df.at[row, c]:{floatfmt}}" for c in columns]
         print("".join(v.ljust(w) for v, w in zip(vals, widths)))
 
-# ==================== 单次快速训练（用于 DRA 搜索） ====================
+
 def train_eval_once(params, Xtr, ytr, Xva, yva, fast_epochs=FAST_EPOCHS, batch=128, weight_decay=5e-4, lr=3e-4):
     torch.cuda.empty_cache()
     L, D = Xtr.shape[1], Xtr.shape[2]
@@ -496,7 +493,7 @@ def train_eval_once(params, Xtr, ytr, Xva, yva, fast_epochs=FAST_EPOCHS, batch=1
     va_metrics, _, _, _ = evaluate(model, dl_va, device)
     return float(va_metrics["macro_f1"]), va_metrics
 
-# ==================== 真·DRA 优化器 & 搜索空间 ====================
+
 def sp_int(u, lo, hi):   return int(np.round(lo + u*(hi-lo)))
 def sp_choice(u, choices):
     idx = int(np.floor(u * len(choices))); idx = min(idx, len(choices)-1); return choices[idx]
@@ -543,15 +540,7 @@ def decode_vector(u, seq_len):
 def vector_dim(): return 15
 
 class TrueDRAOptimizer:
-    """
-    真·DRA：宗派/领袖/传教士/信徒 + 推广/奇迹/替换/奖惩/边界修复 + 退火
-    - 人口：C 个宗派，每派 S 人（含 1 领袖 + M 传教士 + 其余信徒）
-    - 推广：信徒朝领袖/传教士靠拢
-    - 奇迹：低概率大步跃迁/跨派杂交
-    - 替换：每代对最差个体替换（本派内按 SUBSTITUTION_FR 比例）
-    - 奖惩：与前一代成绩比较，自适应调整个体步长
-    - 边界修复：clip + 镜像；并保留少量随机重采样增强探索
-    """
+
     def __init__(self, communities, comm_size, dim, max_gen, seed=42):
         self.C = communities
         self.S = comm_size
@@ -560,12 +549,12 @@ class TrueDRAOptimizer:
         self.max_gen = max_gen
         self.rng = np.random.RandomState(seed)
 
-        # 初始化
-        self.U = self.rng.rand(self.N, self.dim)                   # 决策向量
-        self.steps = self.rng.uniform(STEP_MIN, STEP_MAX, size=(self.N, self.dim))  # 个体步长（向量）
-        self.prev_scores = np.full(self.N, -np.inf, dtype=float)   # 上代得分
-        self.stall = np.zeros(self.N, dtype=int)                   # 连续停滞/劣化计数
-        # 社区划分：顺序分派
+       
+        self.U = self.rng.rand(self.N, self.dim)                  
+        self.steps = self.rng.uniform(STEP_MIN, STEP_MAX, size=(self.N, self.dim))  
+        self.prev_scores = np.full(self.N, -np.inf, dtype=float)   
+        self.stall = np.zeros(self.N, dtype=int)                  
+        
         self.comm_idx = np.repeat(np.arange(self.C), self.S)
 
     @staticmethod
@@ -574,7 +563,7 @@ class TrueDRAOptimizer:
 
     @staticmethod
     def _mirror_repair(x):
-        # 先 clip，再镜像修复（越界的量回弹）
+        
         below = x < 0.0
         above = x > 1.0
         x[below] = -x[below]
@@ -582,53 +571,51 @@ class TrueDRAOptimizer:
         return TrueDRAOptimizer._clip01(x)
 
     def _anneal(self, gen):
-        # 退火：前期探索大、后期收敛强
-        # 返回 [0,1] 区间系数，前大后小
+
         return 1.0 - (gen / max(1, self.max_gen))
 
     def ask(self):
-        """返回当前种群 U（用于评估）"""
+        
         return self.U.copy()
 
     def tell_and_step(self, scores, gen):
-        """
-        根据 scores（越大越好）更新种群，进入下一代
-        """
+       
+       
         assert len(scores) == self.N
-        tau = self._anneal(gen)  # 退火因子
+        tau = self._anneal(gen)  
 
-        # --- 按社区分组，找出每派领袖/传教士/信徒 ---
+        
         U_new = self.U.copy()
         steps_new = self.steps.copy()
         improved_mask = scores > self.prev_scores + 1e-12
         worse_mask = scores < self.prev_scores - 1e-12
         equal_mask = ~(improved_mask | worse_mask)
 
-        # 奖惩调整步长（个体级）
+       
         steps_new[improved_mask] *= (1.0 + REWARD_ALPHA * tau)
         steps_new[worse_mask]    *= (1.0 - PENALTY_BETA * tau)
-        # 对于不变的个体，轻微收缩
+        
         steps_new[equal_mask]    *= (1.0 - 0.05 * tau)
         steps_new = np.clip(steps_new, STEP_MIN, STEP_MAX)
 
-        # 更新 stall 计数并做“流放”
+       
         self.stall[improved_mask] = 0
         self.stall[worse_mask | equal_mask] += 1
 
         for c in range(self.C):
             idx_c = np.where(self.comm_idx == c)[0]
             Uc, Sc = self.U[idx_c], scores[idx_c]
-            order = np.argsort(-Sc)  # 降序
+            order = np.argsort(-Sc)  
             leader_id = idx_c[order[0]]
             mission_ids = idx_c[order[1:1+DRA_TOP_MISSION]] if self.S > 1 else np.array([], dtype=int)
             follower_ids = idx_c[order[1+DRA_TOP_MISSION:]] if self.S > (1+DRA_TOP_MISSION) else np.array([], dtype=int)
 
             u_leader = self.U[leader_id].copy()
 
-            # --- 推广（exploitation）：信徒朝 领袖/传教士 靠拢 ---
+            -
             for i in follower_ids:
                 u = self.U[i]; s = self.steps[i]
-                # 从传教士中挑一个参考（若无，退化为领袖）
+               
                 if len(mission_ids) > 0:
                     j = self.rng.choice(mission_ids)
                     u_m = self.U[j]
@@ -637,21 +624,21 @@ class TrueDRAOptimizer:
 
                 a = self.rng.rand(self.dim) * (PROMOTION_RATE * tau)
                 b = self.rng.rand(self.dim) * (PROMOTION_RATE * tau * 0.7)
-                noise = self.rng.normal(0.0, s * 0.5, size=self.dim)   # 探索噪声随步长变动
+                noise = self.rng.normal(0.0, s * 0.5, size=self.dim)  
 
                 v = u + a*(u_leader - u) + b*(u_m - u) + noise
-                # 小概率促进收敛（均衡 exploitation 与 exploration）
+                
                 if self.rng.rand() < 0.3:
                     v = 0.5*(v + u_leader)
 
-                # 边界修复
+               
                 v = self._mirror_repair(v)
                 U_new[i] = v
 
-            # --- 传教士也进行互学（轻度） ---
+            
             for i in mission_ids:
                 u = self.U[i]; s = self.steps[i]
-                # 与领袖/同僚交互
+                
                 partner_pool = [pid for pid in mission_ids if pid != i]
                 if len(partner_pool) > 0 and self.rng.rand() < 0.6:
                     j = self.rng.choice(partner_pool)
@@ -664,49 +651,45 @@ class TrueDRAOptimizer:
                 v = self._mirror_repair(v)
                 U_new[i] = v
 
-            # --- 奇迹（exploration）：跨派杂交/大步跳变 ---
+            
             for i in idx_c:
                 if self.rng.rand() < MIRACLE_PROB:
-                    # 50% 大步随机跳，50% 跨派杂交
                     if self.rng.rand() < 0.5:
                         v = self.rng.rand(self.dim)
                     else:
-                        # 选另一派一个优秀个体进行一半维度交叉
                         other_c = self.rng.choice([cc for cc in range(self.C) if cc != c])
                         idx_oc = np.where(self.comm_idx == other_c)[0]
                         best_oc = idx_oc[np.argmax(scores[idx_oc])]
                         mate = self.U[best_oc]
                         mask = self.rng.rand(self.dim) < 0.5
                         v = np.where(mask, self.U[i], mate)
-                        # 加一点噪声
                         v += self.rng.normal(0.0, steps_new[i] * 0.2, size=self.dim)
                     v = self._mirror_repair(v)
                     U_new[i] = v
 
-            # --- 替换（substitution）：本派最差替换 ---
             n_sub = max(1, int(np.floor(self.S * SUBSTITUTION_FR)))
             worst_local = idx_c[np.argsort(scores[idx_c])[:n_sub]]
             U_new[worst_local] = self.rng.rand(n_sub, self.dim)
             steps_new[worst_local] = self.rng.uniform(STEP_MIN, STEP_MAX, size=(n_sub, self.dim))
 
-            # --- 流放（exile）：长期停滞/劣化个体强制重置 ---
+           
             exile_ids = idx_c[self.stall[idx_c] >= MAX_STALL_GENS]
             if exile_ids.size > 0:
                 U_new[exile_ids] = self.rng.rand(exile_ids.size, self.dim)
                 steps_new[exile_ids] = self.rng.uniform(STEP_MIN, STEP_MAX, size=(exile_ids.size, self.dim))
-                self.stall[exile_ids] = 0  # 重置滞留计数
+                self.stall[exile_ids] = 0 
 
-        # 全局保持至少一个精英不被破坏（强精英策略）
+       
         best_global = int(np.argmax(scores))
         U_new[best_global] = self.U[best_global]
         steps_new[best_global] = self.steps[best_global]
 
-        # 写回
+        
         self.U = self._clip01(U_new)
         self.steps = np.clip(steps_new, STEP_MIN, STEP_MAX)
         self.prev_scores = scores.copy()
 
-# ==================== 主流程：DRA 搜索 → 最终训练 → 测试 + 回测导出 ====================
+
 def main():
     X_train, y_train, X_val, y_val, X_test, y_test = load_data(data_root)
     Ntr, L, D = X_train.shape
@@ -721,7 +704,7 @@ def main():
     elites, search_rows = [], []
     best_overall = -1.0; no_improve_gen = 0
 
-    # >>> 新增：适应度收敛日志
+   
     fitness_log = []
 
     for gen in range(DRA_GEN):
@@ -744,7 +727,7 @@ def main():
             print(f"[GEN {gen:02d} | IND {i:02d}] macroF1={macro_f1:.4f} params={params}")
             if macro_f1 > best_overall + 1e-6: best_overall = macro_f1; improved = True
 
-        # ---- 新增：记录当代的适应度统计（用于画收敛曲线）----
+        
         best_score   = float(np.max(scores))
         mean_score   = float(np.mean(scores))
         median_score = float(np.median(scores))
@@ -765,20 +748,20 @@ def main():
             elites.append({"u": U[r["idx"]].copy(), "score": r["score"], "params": {k:r[k] for k in r if k not in ("gen","idx","score")}})
         elites = sorted(elites, key=lambda e: e["score"], reverse=True)[:top_k_keep]
 
-        # 代际早停（注意：记录 fitness_log 已在上方完成）
+        
         if improved:
             no_improve_gen = 0
         else:
             no_improve_gen += 1
             if no_improve_gen >= NO_IMPROVE_PATI:
                 print(f"[TrueDRA] Early stop search at generation {gen} (no improvement for {NO_IMPROVE_PATI} gens).")
-                dra.tell_and_step(scores, gen)  # 完成内部状态
+                dra.tell_and_step(scores, gen) 
                 break
 
-        # DRA 进入下一代
+        
         dra.tell_and_step(scores, gen)
 
-    # 记录搜索日志与最佳参数
+    
     pd.DataFrame(search_rows).to_csv(os.path.join(out_dir, "search_log.csv"), index=False, encoding="utf-8-sig")
     best = max(search_rows, key=lambda r: r["score"])
     best_params = {k:best[k] for k in best.keys() if k not in ("gen","idx","score")}
@@ -786,7 +769,7 @@ def main():
         json.dump({"best_macro_f1": float(best["score"]), "best_params": best_params}, f, ensure_ascii=False, indent=2)
     print("Best (by macroF1):", best_params, "score=", best["score"])
 
-    # ---------- 新增：适应度曲线落盘与绘图 ----------
+    --
     df_fit = pd.DataFrame(fitness_log)
     df_fit.to_csv(os.path.join(out_dir, "fitness_curve.csv"), index=False, encoding="utf-8-sig")
 
@@ -796,7 +779,6 @@ def main():
     plt.plot(df_fit["gen"], df_fit["median"], label="Median (global)")
     if "topk_mean" in df_fit.columns:
         plt.plot(df_fit["gen"], df_fit["topk_mean"], label="Top-4 Mean")
-    # 各宗派最佳（虚线）
     for c in range(DRA_COMMUNITIES):
         col = f"comm{c}_best"
         if col in df_fit.columns:
@@ -808,7 +790,6 @@ def main():
     plt.savefig(os.path.join(out_dir, "fitness_curve.png"), dpi=300)
     plt.close()
 
-    # ---------- 最终训练（val 早停） ----------
     dl_tr = make_loader(X_train, y_train, batch=best_params["batch_size"], shuffle=True)
     dl_va = make_loader(X_val,   y_val,   batch=best_params["batch_size"], shuffle=False)
     dl_te = make_loader(X_test,  y_test,  batch=best_params["batch_size"], shuffle=False)
@@ -891,7 +872,6 @@ def main():
     if best_state is not None: model.load_state_dict(best_state)
     torch.save(model.state_dict(), os.path.join(out_dir, "best_model.pth"))
 
-    # ---------- 测试 ----------
     test_metrics, y_pred, logits, y_true = evaluate(model, dl_te, device)
     print("==== Test Metrics ===="); print(test_metrics)
     pd.DataFrame([test_metrics]).to_csv(os.path.join(out_dir, "metrics_test.csv"), index=False, encoding="utf-8-sig")
@@ -924,14 +904,11 @@ def main():
         floatfmt=table_floatfmt
     )
 
-    # ==================== === 回测所需数据导出 === ====================
-    # 1) 概率矩阵（列顺序：probs_down, probs_up）
     probs = softmax_np(logits)
     if probs.shape[1] != 2:
         raise RuntimeError(f"期望二分类概率 shape [N,2]，实际 {probs.shape}")
     np.save(os.path.join(out_dir, "test_probs.npy"), probs)
 
-    # 2) 从 meta + split 大小恢复“测试样本末端在原始时间轴上的索引”
     meta_path = os.path.join(data_root, "meta_summary.csv")
     default_seq_len = X_train.shape[1]
     seq_len_meta, stride_meta = _parse_meta(meta_path, default_seq_len, default_stride=1)
@@ -943,7 +920,6 @@ def main():
                             te0 + (seq_len_meta - 1) + stride_meta * X_test.shape[0],
                             stride_meta, dtype=int)
 
-    # 3) 读取对齐表（包含日期与价格列）
     aligned_csv = os.path.join(data_root, "features_labels_aligned.csv")
     if not os.path.exists(aligned_csv):
         raise FileNotFoundError(f"找不到对齐表：{aligned_csv}。请确认预处理阶段已写出该文件。")
@@ -962,7 +938,6 @@ def main():
     if high_col is None or low_col is None:
         print("[Warn] 未识别到 high/low 列，将以 NaN 填充价格。")
 
-    # 4) 组装导出（t 与 t+1）
     df_bt = pd.DataFrame({
         "idx_t": end_indices,
         "date_t": pd.to_datetime(df_aln.loc[end_indices, date_col].values, errors="coerce")
@@ -979,17 +954,14 @@ def main():
     df_bt["high_t1"]  = df_aln.loc[end_indices_next, high_col].values  if high_col  in df_aln.columns else np.nan
     df_bt["low_t1"]   = df_aln.loc[end_indices_next, low_col].values   if low_col   in df_aln.columns else np.nan
 
-    # 5) 概率/预测/真值
     df_bt["probs_down"] = probs[:, 0]
     df_bt["probs_up"]   = probs[:, 1]
     df_bt["y_pred"]     = y_pred.astype(int)
     df_bt["y_true"]     = y_true.astype(int)
 
-    # 6) 标准化日期列（回测统一使用）
     df_bt["date"] = pd.to_datetime(df_bt["date_t"], errors="coerce")
     df_bt["date_str"] = df_bt["date"].dt.strftime("%Y-%m-%d")
 
-    # 7) 落盘
     backtest_csv = os.path.join(out_dir, "preds_test_with_prices.csv")
     df_bt.to_csv(backtest_csv, index=False, encoding="utf-8-sig")
 
@@ -999,7 +971,6 @@ def main():
 
     print("All done. Results in:", out_dir)
     print("Backtest export:", backtest_csv)
-    # ==================== === 回测所需数据导出 === ====================
 
 if __name__ == "__main__":
     main()
