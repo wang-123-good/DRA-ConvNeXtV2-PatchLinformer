@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 warnings.filterwarnings("ignore")
 
-# =================== 可调参数 ===================
 OUT_BASE_DIR   = "./dra_convnextv2_patchlinformer"
 IN_CSV         = os.path.join(OUT_BASE_DIR, "preds_test_with_prices.csv")
 
@@ -23,7 +22,6 @@ OUT_DIR = os.path.join(
 )
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# =================== 工具函数 ===================
 def annualized_return_from_curve(equity: np.ndarray, dates: pd.Series) -> float:
     if equity.size < 2:
         return 0.0
@@ -50,7 +48,6 @@ def max_drawdown(equity: np.ndarray) -> float:
     dd = (equity - peaks) / peaks
     return float(-dd.min()) if dd.size > 0 else 0.0
 
-# =================== 数据读取 ===================
 if not os.path.exists(IN_CSV):
     raise FileNotFoundError(f"找不到输入文件：{IN_CSV}\n请先运行训练脚本，确保已生成 preds_test_with_prices.csv。")
 
@@ -73,7 +70,6 @@ close1= df["close_t1"].astype(float).values
 p_up  = df["probs_up"].astype(float).values
 N     = len(df)
 
-# =================== 回测逻辑 ===================
 in_position = False
 entry_idx   = -1
 entry_price = np.nan
@@ -139,14 +135,12 @@ while i < N:
 equity_curve = np.array(equity_curve, dtype=float)
 daily_returns = np.array(daily_returns, dtype=float)
 
-# =================== 基准（买入并持有） ===================
 bench_daily = np.zeros(N, dtype=float)
 bench_daily[0] = 0.0
 for k in range(1, N):
     bench_daily[k] = (close1[k] / close1[k-1]) - 1.0 if close1[k-1] > 0 else 0.0
 bench_equity = INIT_CASH * np.cumprod(1.0 + bench_daily)
 
-# =================== 指标 ===================
 ann_ret = annualized_return_from_curve(equity_curve, dates)
 sharpe = sharpe_ratio(daily_returns)
 mdd    = max_drawdown(equity_curve)
@@ -161,7 +155,6 @@ df_metrics = pd.DataFrame([
 ], columns=["指标", "值"])
 df_metrics.to_csv(os.path.join(OUT_DIR, "metrics.csv"), index=False, encoding="utf-8-sig")
 
-# =================== 净值导出 ===================
 df_curve = pd.DataFrame({
     "date": dates.dt.strftime("%Y-%m-%d"),
     "equity": equity_curve,
@@ -176,7 +169,6 @@ df_net = pd.DataFrame({
 })
 df_net.to_csv(os.path.join(OUT_DIR, "netvalue_curve.csv"), index=False, encoding="utf-8-sig")
 
-# =================== 绘制净值曲线 ===================
 plt.figure(figsize=(10,5.5), facecolor="white")
 plt.plot(pd.to_datetime(df_net["date"]), df_net["strategy_net"],
          color="red", label="Strategy Net Worth", linewidth=1.5)
