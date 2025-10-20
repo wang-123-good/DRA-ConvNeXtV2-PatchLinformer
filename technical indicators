@@ -1,9 +1,7 @@
-# -*- coding: utf-8 -*-
 import pandas as pd
 import numpy as np
 import os
 
-# ---------- Helpers: robust column detection ----------
 POSSIBLE_NAMES = {
     "date": ["date", "datetime", "time", "交易日期", "时间"],
     "open": ["open", "opening price", "始値", "开盘", "open_price"],
@@ -27,7 +25,6 @@ def find_col(cols, keys):
                 return c
     return None
 
-# ---------- Technical indicators (no TA-Lib needed) ----------
 def ema(s: pd.Series, span: int):
     return s.ewm(span=span, adjust=False).mean()
 
@@ -61,7 +58,6 @@ def stochastic_kdj(high: pd.Series, low: pd.Series, close: pd.Series,
     J = 3.0 * K - 2.0 * D
     return K, D, J
 
-# ---------- Main feature builder ----------
 def cal_feature(df: pd.DataFrame) -> pd.DataFrame:
     # normalize key columns
     open_col  = find_col(df.columns, POSSIBLE_NAMES["open"])
@@ -79,29 +75,22 @@ def cal_feature(df: pd.DataFrame) -> pd.DataFrame:
     if vol_col:
         df.rename(columns={vol_col:"vol"}, inplace=True)
     else:
-        # 如果没有成交量列，用 NaN 占位
         df["vol"] = np.nan
 
-    # 1) 收益率
     df["1_day_Return"]  = df["close"].pct_change()
 
     df["10_day_Return"] = df["close"].pct_change(10)
     df["future_10d_return"] = df["close"].shift(-10) / df["close"] - 1
 
-    # 2) 波动（过去30日收益率标准差）
     df["SD"] = df["1_day_Return"].rolling(window=30, min_periods=30).std()
 
-    # 3) 偏度（过去30日收益率）
     df["skewness"] = df["1_day_Return"].rolling(window=30, min_periods=30).skew()
 
-    # 4) 成交量增长率
     df["pct_vol"] = df["vol"].pct_change()
 
-    # 6) 均线
     df["MA5"]  = df["close"].rolling(5,  min_periods=5).mean()
     df["MA10"] = df["close"].rolling(10, min_periods=10).mean()
 
-    # 7) 技术指标（RSI/MOM/EMA/MACD/KDJ 等）
     df["RSI"]   = rsi(df["close"], period=12)
     df["MOM"]   = momentum(df["close"], period=5)
     df["EMA12"] = ema(df["close"], span=12)
@@ -118,7 +107,6 @@ def cal_feature(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna().reset_index(drop=True)
     return df
 
-# --------- Load input, compute features, save ----------
 if __name__ == "__main__":
     in_path = "600276.xlsx"  # 示例：Excel 文件
     out_path = "600276_with_features.csv"
