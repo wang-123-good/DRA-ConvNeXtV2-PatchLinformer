@@ -20,7 +20,7 @@ R_TRAIN, R_VAL, R_TEST = 0.70, 0.15, 0.15
 
 MIN_ROWS_AFTER_CLEAN = 200
 
-EXCLUDE_COLS = {"future_10d_return","10_day_Return","1_day_Return""label_binary"}
+EXCLUDE_COLS = {"future_10d_return","10_day_Return","1_day_Return","label_binary"}
 
 
 DATE_CANDIDATES = ["Date"]
